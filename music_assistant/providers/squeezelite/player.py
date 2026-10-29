@@ -29,7 +29,6 @@ from music_assistant_models.errors import InvalidCommand, MusicAssistantError
 from music_assistant.constants import (
     CONF_ENTRY_HTTP_PROFILE_FORCED_2,
     CONF_ENTRY_PREFER_WAV_FOR_LIVE_SOURCES_DEFAULT_ENABLED,
-    CONF_ENTRY_SYNC_ADJUST,
     CONF_OUTPUT_CODEC,
     CONF_PREFER_WAV_FOR_LIVE_SOURCES,
     VERBOSE_LOG_LEVEL,
@@ -46,7 +45,16 @@ from music_assistant.models.player import (
 
 from .constants import (
     CONF_ENTRY_DISPLAY,
+    CONF_ENTRY_SYNC_ADJUST_SQUEEZELITE,
+    CONF_ENTRY_SYNC_JUMP_IGNORE_MS,
+    CONF_ENTRY_SYNC_MAX_SKIP_AHEAD_MS,
+    CONF_ENTRY_SYNC_MIN_ADJUST_MS,
+    CONF_ENTRY_SYNC_PLAYPOINTS,
     CONF_ENTRY_VISUALIZATION,
+    CONF_SYNC_JUMP_IGNORE_MS,
+    CONF_SYNC_MAX_SKIP_AHEAD_MS,
+    CONF_SYNC_MIN_ADJUST_MS,
+    CONF_SYNC_PLAYPOINTS,
     DEFAULT_PLAYER_VOLUME,
     DEVIATION_JUMP_IGNORE,
     MAX_SKIP_AHEAD_MS,
@@ -129,9 +137,14 @@ class SqueezelitePlayer(Player):
         self.multi_client_stream: MultiClientStream | None = None
         self._sync_playpoints: deque[SyncPlayPoint] = deque(maxlen=MIN_REQ_PLAYPOINTS)
         self._do_not_resync_before: float = 0.0
+        # per-player sync tuning, refreshed from the player config in on_config_updated
+        self._sync_min_adjust_ms: int = MIN_DEVIATION_ADJUST
+        self._sync_jump_ignore_ms: int = DEVIATION_JUMP_IGNORE
+        self._sync_max_skip_ahead_ms: int = MAX_SKIP_AHEAD_MS
 
     async def on_config_updated(self) -> None:
         """Handle logic when the PlayerConfig is first loaded or updated."""
+        self._load_sync_tuning()
         # set presets and display
         await self._set_preset_items()
         await self._set_display()
@@ -181,7 +194,11 @@ class SqueezelitePlayer(Player):
         return [
             *base_entries,
             *preset_entries,
-            CONF_ENTRY_SYNC_ADJUST,
+            CONF_ENTRY_SYNC_ADJUST_SQUEEZELITE,
+            CONF_ENTRY_SYNC_MIN_ADJUST_MS,
+            CONF_ENTRY_SYNC_PLAYPOINTS,
+            CONF_ENTRY_SYNC_JUMP_IGNORE_MS,
+            CONF_ENTRY_SYNC_MAX_SKIP_AHEAD_MS,
             CONF_ENTRY_DISPLAY,
             CONF_ENTRY_VISUALIZATION,
             CONF_ENTRY_HTTP_PROFILE_FORCED_2,
@@ -684,16 +701,22 @@ class SqueezelitePlayer(Player):
         )
 
         sync_playpoints.append(SyncPlayPoint(now, sync_master.player_id, diff))
+        self.logger.log(
+            VERBOSE_LOG_LEVEL, "%s sync diff vs %s: %sms", self.display_name, sync_master.name, diff
+        )
 
         # ignore unexpected spikes
         if (
             sync_playpoints
             and abs(statistics.fmean(abs(x.diff) for x in sync_playpoints) - abs(diff))
-            > DEVIATION_JUMP_IGNORE
+            > self._sync_jump_ignore_ms
         ):
             return
 
-        min_req_playpoints = 2 if sync_master.elapsed_seconds < 2 else MIN_REQ_PLAYPOINTS
+        # the deque holds exactly the configured number of measurements
+        min_req_playpoints = (
+            2 if sync_master.elapsed_seconds < 2 else (sync_playpoints.maxlen or MIN_REQ_PLAYPOINTS)
+        )
         if len(sync_playpoints) < min_req_playpoints:
             return
 
@@ -701,15 +724,16 @@ class SqueezelitePlayer(Player):
         avg_diff = statistics.fmean(x.diff for x in sync_playpoints)
         delta = int(abs(avg_diff))
 
-        if delta < MIN_DEVIATION_ADJUST:
+        if delta < self._sync_min_adjust_ms:
             return
 
         # resync the player by skipping ahead or pause for x amount of (milli)seconds
         sync_playpoints.clear()
         self._do_not_resync_before = now + 5
-        if avg_diff > MAX_SKIP_AHEAD_MS:
-            # player lagging behind more than MAX_SKIP_AHEAD_MS,
-            # we need to correct the sync_master
+        if self._sync_max_skip_ahead_ms and avg_diff > self._sync_max_skip_ahead_ms:
+            # player lagging behind more than the configured maximum skip-ahead,
+            # we need to correct the sync_master (a value of 0 disables this and
+            # always lets the lagging player skip ahead instead)
             self.logger.debug("%s resync: pauseFor %sms", sync_master.name, delta)
             self.mass.create_task(pause_and_unpause(sync_master, delta))
         elif avg_diff > 0:
@@ -792,6 +816,22 @@ class SqueezelitePlayer(Player):
         return self.mass.config.get_raw_player_config_value(
             member_player_id, CONF_OUTPUT_CODEC, "flac"
         )
+
+    def _load_sync_tuning(self) -> None:
+        """Cache the per-player sync tuning values and resize the playpoint window."""
+        self._sync_min_adjust_ms = cast(
+            "int", self.config.get_value(CONF_SYNC_MIN_ADJUST_MS, MIN_DEVIATION_ADJUST)
+        )
+        self._sync_jump_ignore_ms = cast(
+            "int", self.config.get_value(CONF_SYNC_JUMP_IGNORE_MS, DEVIATION_JUMP_IGNORE)
+        )
+        self._sync_max_skip_ahead_ms = cast(
+            "int", self.config.get_value(CONF_SYNC_MAX_SKIP_AHEAD_MS, MAX_SKIP_AHEAD_MS)
+        )
+        playpoints = cast("int", self.config.get_value(CONF_SYNC_PLAYPOINTS, MIN_REQ_PLAYPOINTS))
+        if playpoints != self._sync_playpoints.maxlen:
+            # rebuilding keeps the newest measurements and drops the surplus
+            self._sync_playpoints = deque(self._sync_playpoints, maxlen=playpoints)
 
 
 async def pause_and_unpause(slim_client: SlimClient, pause_duration_ms: int) -> None:

@@ -27,6 +27,26 @@
     "preset": {
       "label": "Preset {0}",
       "description": "Assign a playable item to the player's preset. Only supported on real squeezebox hardware or jive(lite) based emulators."
+    },
+    "sync_adjust": {
+      "label": "Audio synchronization delay correction",
+      "description": "Shifts when this player plays relative to the other players in its sync group. Positive values make this player play earlier, which compensates a device that adds its own processing delay (for example a converted speaker or an external amplifier); negative values make it play later. Squeezelite players accept up to 5000 ms in either direction. Changing this value restarts playback."
+    },
+    "sync_min_adjust_ms": {
+      "label": "Minimum sync correction (ms)",
+      "description": "The smallest drift between this player and the sync leader that is corrected. Lower values keep the group tighter but correct more often; raise it for a player with a jittery clock."
+    },
+    "sync_playpoints": {
+      "label": "Sync measurements before correcting",
+      "description": "The number of consecutive position measurements (about one per second) that are averaged before a correction is sent. Lower values react faster, higher values are more stable."
+    },
+    "sync_jump_ignore_ms": {
+      "label": "Ignore sudden sync jumps above (ms)",
+      "description": "A single measurement that deviates more than this from the running average is treated as a glitch and ignored."
+    },
+    "sync_max_skip_ahead_ms": {
+      "label": "Maximum skip-ahead (ms)",
+      "description": "When this player lags behind the sync leader by more than this, the leader is paused briefly to let it catch up instead of this player skipping ahead. Set to 0 to never pause the leader and always let this player skip ahead; recommended for large groups and for a player with a large delay correction."
     }
   },
   "manifest": {
