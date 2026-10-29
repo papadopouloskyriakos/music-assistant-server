@@ -13,6 +13,7 @@ from aioslimproto.models import SlimEvent
 from music_assistant_models.enums import ContentType
 from music_assistant_models.media_items import AudioFormat
 
+from music_assistant.models.player_provider import PlayerProvider
 from music_assistant.providers.squeezelite.player import SqueezelitePlayer
 from music_assistant.providers.squeezelite.provider import SqueezelitePlayerProvider
 
@@ -100,3 +101,34 @@ def test_reconnected_member_leaves_its_sync_leader() -> None:
         SqueezelitePlayerProvider._handle_slimproto_event(provider, event)
 
     assert leader.group_members == []
+
+
+async def test_sync_start_delay_change_does_not_reload_the_provider() -> None:
+    """The group start headroom applies live; a port change still reloads the provider."""
+    provider = SqueezelitePlayerProvider.__new__(SqueezelitePlayerProvider)
+    provider.logger = MagicMock()
+    config = MagicMock()
+    with (
+        patch.object(PlayerProvider, "update_config", AsyncMock()) as base_update,
+        patch.object(provider, "_set_log_level_from_config"),
+    ):
+        await provider.update_config(config, {"values/sync_start_delay_ms"})
+        base_update.assert_not_awaited()
+        assert provider.config is config
+
+        await provider.update_config(config, {"values/port"})
+        base_update.assert_awaited_once()
+
+
+def test_underrun_event_reaches_the_player() -> None:
+    """An output underrun is forwarded to the player like every other player event."""
+    provider = SqueezelitePlayerProvider.__new__(SqueezelitePlayerProvider)
+    provider.mass = MagicMock(closing=False)
+    provider.slimproto = MagicMock()
+    player = MagicMock()
+    provider.mass.players.get_player.return_value = player
+    event = SlimEvent(SlimEventType.PLAYER_OUTPUT_UNDERRUN, "m1")
+
+    provider._handle_slimproto_event(event)
+
+    player.handle_slim_event.assert_called_once_with(event)

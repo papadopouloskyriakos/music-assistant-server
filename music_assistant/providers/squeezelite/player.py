@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-import statistics
 import time
-from collections import deque
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, cast
 
+from aioslimproto.errors import PlayerClockUnknown
 from aioslimproto.models import EventType as SlimEventType
 from aioslimproto.models import PlayerState as SlimPlayerState
 from aioslimproto.models import Preset as SlimPreset
@@ -31,6 +30,7 @@ from music_assistant.constants import (
     CONF_ENTRY_PREFER_WAV_FOR_LIVE_SOURCES_DEFAULT_ENABLED,
     CONF_OUTPUT_CODEC,
     CONF_PREFER_WAV_FOR_LIVE_SOURCES,
+    CONF_SYNC_ADJUST,
     VERBOSE_LOG_LEVEL,
 )
 from music_assistant.controllers.streams.audio_processing import get_media_session_id
@@ -44,25 +44,29 @@ from music_assistant.models.player import (
 )
 
 from .constants import (
+    BUFFER_READY_TIMEOUT_S,
     CONF_ENTRY_DISPLAY,
     CONF_ENTRY_SYNC_ADJUST_SQUEEZELITE,
-    CONF_ENTRY_SYNC_JUMP_IGNORE_MS,
-    CONF_ENTRY_SYNC_MAX_SKIP_AHEAD_MS,
+    CONF_ENTRY_SYNC_MAINTAIN,
     CONF_ENTRY_SYNC_MIN_ADJUST_MS,
-    CONF_ENTRY_SYNC_PLAYPOINTS,
+    CONF_ENTRY_SYNC_PACKET_LATENCY_MS,
     CONF_ENTRY_VISUALIZATION,
-    CONF_SYNC_JUMP_IGNORE_MS,
-    CONF_SYNC_MAX_SKIP_AHEAD_MS,
+    CONF_SYNC_MAINTAIN,
     CONF_SYNC_MIN_ADJUST_MS,
-    CONF_SYNC_PLAYPOINTS,
+    CONF_SYNC_PACKET_LATENCY_MS,
     DEFAULT_PLAYER_VOLUME,
-    DEVIATION_JUMP_IGNORE,
-    MAX_SKIP_AHEAD_MS,
-    MIN_DEVIATION_ADJUST,
-    MIN_REQ_PLAYPOINTS,
+    DEFAULT_SYNC_MIN_ADJUST_MS,
+    DEFAULT_SYNC_PACKET_LATENCY_MS,
     REPEATMODE_MAP,
     STATE_MAP,
-    SyncPlayPoint,
+    SYNC_CHECK_INTERVAL_S,
+    SYNC_MAX_CORRECTION_S,
+    SYNC_MIN_CORRECTION_S,
+    SYNC_PLAYPOINT_MAX_AGE_S,
+    SYNC_SKIP_COOLDOWN_S,
+    SYNC_START_HOLD_OFF_S,
+    SYNC_START_MAX_LEAD_S,
+    SyncSettings,
 )
 from .multi_client_stream import MultiClientStream
 
@@ -135,16 +139,17 @@ class SqueezelitePlayer(Player):
             for bd in (16, 24)
         ]
         self.multi_client_stream: MultiClientStream | None = None
-        self._sync_playpoints: deque[SyncPlayPoint] = deque(maxlen=MIN_REQ_PLAYPOINTS)
-        self._do_not_resync_before: float = 0.0
-        # per-player sync tuning, refreshed from the player config in on_config_updated
-        self._sync_min_adjust_ms: int = MIN_DEVIATION_ADJUST
-        self._sync_jump_ignore_ms: int = DEVIATION_JUMP_IGNORE
-        self._sync_max_skip_ahead_ms: int = MAX_SKIP_AHEAD_MS
+        # sync leader state: per member, the server time before which it is left alone
+        # (right after a scheduled start or a correction), and the time of the last check
+        self._sync_hold_off_until: dict[str, float] = {}
+        self._last_sync_check: float = 0.0
 
     async def on_config_updated(self) -> None:
         """Handle logic when the PlayerConfig is first loaded or updated."""
-        self._load_sync_tuning()
+        self.client.packet_latency_ms = cast(
+            "int",
+            self.config.get_value(CONF_SYNC_PACKET_LATENCY_MS, DEFAULT_SYNC_PACKET_LATENCY_MS),
+        )
         # set presets and display
         await self._set_preset_items()
         await self._set_display()
@@ -195,10 +200,9 @@ class SqueezelitePlayer(Player):
             *base_entries,
             *preset_entries,
             CONF_ENTRY_SYNC_ADJUST_SQUEEZELITE,
+            CONF_ENTRY_SYNC_MAINTAIN,
             CONF_ENTRY_SYNC_MIN_ADJUST_MS,
-            CONF_ENTRY_SYNC_PLAYPOINTS,
-            CONF_ENTRY_SYNC_JUMP_IGNORE_MS,
-            CONF_ENTRY_SYNC_MAX_SKIP_AHEAD_MS,
+            CONF_ENTRY_SYNC_PACKET_LATENCY_MS,
             CONF_ENTRY_DISPLAY,
             CONF_ENTRY_VISUALIZATION,
             CONF_ENTRY_HTTP_PROFILE_FORCED_2,
@@ -239,6 +243,7 @@ class SqueezelitePlayer(Player):
         if self.multi_client_stream is not None:
             await self.multi_client_stream.stop()
             self.multi_client_stream = None
+        self._sync_hold_off_until.clear()
         async with TaskManager(self.mass) as tg:
             for client in self._get_sync_clients():
                 if self.type == PlayerType.PROTOCOL:
@@ -269,6 +274,7 @@ class SqueezelitePlayer(Player):
         if self.multi_client_stream is not None:
             await self.multi_client_stream.stop()
             self.multi_client_stream = None
+        self._sync_hold_off_until.clear()
 
         # Clear next media item during announcements to prevent playing the
         # next enqueued track after it finishes.
@@ -376,8 +382,9 @@ class SqueezelitePlayer(Player):
             for sync_client in self._get_sync_clients():
                 if sync_client.player_id in player_ids_to_remove:
                     if sync_client.player_id in self._attr_group_members:
-                        # remove child from the group
+                        # remove child from the group; the others play on
                         self._attr_group_members.remove(sync_client.player_id)
+                        self._sync_hold_off_until.pop(sync_client.player_id, None)
                         if sync_client.state != SlimPlayerState.STOPPED:
                             # stop the player if it is playing
                             await sync_client.stop()
@@ -409,12 +416,13 @@ class SqueezelitePlayer(Player):
         self.update_state()
 
         if (
-            (players_added or player_ids_to_remove)
+            players_added
             and self.state.current_media
             and self._attr_playback_state == PlaybackState.PLAYING
         ):
             # restart stream session if it was already playing
-            # for now, we dont support late joining into an existing stream
+            # for now, we dont support late joining into an existing stream; a member
+            # leaving needs no restart, its stream subscription just ends
             # a back-to-back restart reads the position of the one before it, so the newest wins
             self.mass.create_task(
                 self.mass.players.cmd_resume(self.player_id),
@@ -448,6 +456,9 @@ class SqueezelitePlayer(Player):
         if event.type in (SlimEventType.PLAYER_BTN_EVENT, SlimEventType.PLAYER_CLI_EVENT):
             self.mass.create_task(self._handle_player_cli_event(event))
             return
+
+        if event.type == SlimEventType.PLAYER_OUTPUT_UNDERRUN:
+            self._handle_output_underrun()
 
         # all other: update attributes and update state
         self.update_attributes()
@@ -491,6 +502,19 @@ class SqueezelitePlayer(Player):
             )
         else:
             self._attr_current_media = None
+
+    def handle_member_output_underrun(self, player_id: str) -> None:
+        """
+        Let a member that ran out of audio be corrected on the next sync check.
+
+        Squeezelite refills and resumes on its own timeline, so the member comes back
+        behind the others; dropping its hold-off lets the leader skip it into place at
+        the next check instead of waiting out a cooldown.
+
+        :param player_id: The player id of the member that reported the underrun.
+        """
+        if self._sync_hold_off_until.pop(player_id, None) is not None:
+            self.logger.debug("%s ran out of audio, it is resynced on the next check", player_id)
 
     async def _handle_play_url_for_slimplayer(
         self,
@@ -580,9 +604,9 @@ class SqueezelitePlayer(Player):
         ):
             self.update_state()
 
-        # handle sync
-        if self.synced_to:
-            self._handle_sync()
+        # the sync leader keeps its members in line
+        if self.group_members:
+            self._check_group_sync()
 
     async def _handle_buffer_ready(self) -> None:
         """
@@ -597,27 +621,8 @@ class SqueezelitePlayer(Player):
             # not a sync group, continue
             await self.client.unpause_at(self.client.jiffies)
             return
-        count = 0
-        while count < 40:
-            childs_total = 0
-            childs_ready = 0
-            await asyncio.sleep(0.2)
-            for sync_child in self._get_sync_clients():
-                childs_total += 1
-                if sync_child.state == SlimPlayerState.BUFFER_READY:
-                    childs_ready += 1
-            if childs_total == childs_ready:
-                break
-            count += 1
-
-        # all child's ready (or timeout) - start play
-        async with TaskManager(self.mass) as tg:
-            for sync_client in self._get_sync_clients():
-                # NOTE: Officially you should do an unpause_at based on the player timestamp
-                # but I did not have any good results with that.
-                # Instead just start playback on all players and let the sync logic work out
-                # the delays etc.
-                tg.create_task(pause_and_unpause(sync_client, 200))
+        await self._wait_for_members_buffer_ready()
+        await self._start_group_at(self._group_start_time())
 
     async def _handle_player_cli_event(self, event: SlimEvent) -> None:
         """Process CLI Event."""
@@ -662,88 +667,6 @@ class SqueezelitePlayer(Player):
             if param.isnumeric():
                 await self.mass.player_queues.seek(queue.queue_id, int(param))
         self.logger.log(VERBOSE_LOG_LEVEL, "CLI Event: %s", event_data)
-
-    def _handle_sync(self) -> None:
-        """Synchronize audio of a sync slimplayer."""
-        sync_master_id = self.synced_to
-        if not sync_master_id:
-            # we only correct sync members, not the sync master itself
-            return
-        if not self._provider.slimproto or not (
-            sync_master := self._provider.slimproto.get_player(sync_master_id)
-        ):
-            return  # just here as a guard as bad things can happen
-
-        if sync_master.state != SlimPlayerState.PLAYING:
-            return
-        if self.client.state != SlimPlayerState.PLAYING:
-            return
-
-        # we collect a few playpoints of the player to determine
-        # average lag/drift so we can adjust accordingly
-        sync_playpoints = self._sync_playpoints
-
-        now = time.time()
-        if now < self._do_not_resync_before:
-            return
-
-        last_playpoint = sync_playpoints[-1] if sync_playpoints else None
-        if last_playpoint and (now - last_playpoint.timestamp) > 10:
-            # last playpoint is too old, invalidate
-            sync_playpoints.clear()
-        if last_playpoint and last_playpoint.sync_master != sync_master.player_id:
-            # this should not happen, but just in case
-            sync_playpoints.clear()
-
-        diff = int(
-            self._provider.get_corrected_elapsed_milliseconds(sync_master)
-            - self._provider.get_corrected_elapsed_milliseconds(self.client)
-        )
-
-        sync_playpoints.append(SyncPlayPoint(now, sync_master.player_id, diff))
-        self.logger.log(
-            VERBOSE_LOG_LEVEL, "%s sync diff vs %s: %sms", self.display_name, sync_master.name, diff
-        )
-
-        # ignore unexpected spikes
-        if (
-            sync_playpoints
-            and abs(statistics.fmean(abs(x.diff) for x in sync_playpoints) - abs(diff))
-            > self._sync_jump_ignore_ms
-        ):
-            return
-
-        # the deque holds exactly the configured number of measurements
-        min_req_playpoints = (
-            2 if sync_master.elapsed_seconds < 2 else (sync_playpoints.maxlen or MIN_REQ_PLAYPOINTS)
-        )
-        if len(sync_playpoints) < min_req_playpoints:
-            return
-
-        # get the average diff
-        avg_diff = statistics.fmean(x.diff for x in sync_playpoints)
-        delta = int(abs(avg_diff))
-
-        if delta < self._sync_min_adjust_ms:
-            return
-
-        # resync the player by skipping ahead or pause for x amount of (milli)seconds
-        sync_playpoints.clear()
-        self._do_not_resync_before = now + 5
-        if self._sync_max_skip_ahead_ms and avg_diff > self._sync_max_skip_ahead_ms:
-            # player lagging behind more than the configured maximum skip-ahead,
-            # we need to correct the sync_master (a value of 0 disables this and
-            # always lets the lagging player skip ahead instead)
-            self.logger.debug("%s resync: pauseFor %sms", sync_master.name, delta)
-            self.mass.create_task(pause_and_unpause(sync_master, delta))
-        elif avg_diff > 0:
-            # handle player lagging behind, fix with skip_ahead
-            self.logger.debug("%s resync: skipAhead %sms", self.display_name, delta)
-            self.mass.create_task(self.client.skip_over(delta))
-        else:
-            # handle player is drifting too far ahead, use pause_for to adjust
-            self.logger.debug("%s resync: pauseFor %sms", self.display_name, delta)
-            self.mass.create_task(pause_and_unpause(self.client, delta))
 
     async def _set_preset_items(self) -> None:
         """Set the presets for a player."""
@@ -817,30 +740,118 @@ class SqueezelitePlayer(Player):
             member_player_id, CONF_OUTPUT_CODEC, "flac"
         )
 
-    def _load_sync_tuning(self) -> None:
-        """Cache the per-player sync tuning values and resize the playpoint window."""
-        self._sync_min_adjust_ms = cast(
-            "int", self.config.get_value(CONF_SYNC_MIN_ADJUST_MS, MIN_DEVIATION_ADJUST)
-        )
-        self._sync_jump_ignore_ms = cast(
-            "int", self.config.get_value(CONF_SYNC_JUMP_IGNORE_MS, DEVIATION_JUMP_IGNORE)
-        )
-        self._sync_max_skip_ahead_ms = cast(
-            "int", self.config.get_value(CONF_SYNC_MAX_SKIP_AHEAD_MS, MAX_SKIP_AHEAD_MS)
-        )
-        playpoints = cast("int", self.config.get_value(CONF_SYNC_PLAYPOINTS, MIN_REQ_PLAYPOINTS))
-        if playpoints != self._sync_playpoints.maxlen:
-            # rebuilding keeps the newest measurements and drops the surplus
-            self._sync_playpoints = deque(self._sync_playpoints, maxlen=playpoints)
+    def _check_group_sync(self) -> None:
+        """Skip lagging members ahead to the member furthest ahead (Lyrion's _CheckSync)."""
+        now = time.time()
+        if now - self._last_sync_check < SYNC_CHECK_INTERVAL_S:
+            return
+        self._last_sync_check = now
+        candidates: list[tuple[SlimClient, float, SyncSettings]] = []
+        for client in self._get_sync_clients():
+            settings = self._sync_settings(client.player_id)
+            if not settings.maintain:
+                continue
+            playpoint = client.playpoint
+            if (
+                client.state != SlimPlayerState.PLAYING
+                or playpoint is None
+                or now - playpoint.measured_at > SYNC_PLAYPOINT_MAX_AGE_S
+            ):
+                # a partial view would pick the wrong reference and skip the wrong players
+                self.logger.log(
+                    VERBOSE_LOG_LEVEL,
+                    "sync check skipped: no fresh play point from %s",
+                    client.name,
+                )
+                return
+            candidates.append(
+                (client, playpoint.apparent_start_time + settings.play_delay_ms / 1000, settings)
+            )
+        if len(candidates) < 2:
+            return
+        # apparent start = server time - elapsed: the earliest apparent start is the player
+        # furthest ahead, and every slimproto player can skip ahead, so that is the reference
+        reference_client, reference_start, _ = min(candidates, key=lambda item: item[1])
+        for client, start, settings in candidates:
+            behind = start - reference_start
+            self.logger.log(
+                VERBOSE_LOG_LEVEL,
+                "%s is %d ms behind %s",
+                client.name,
+                round(behind * 1000),
+                reference_client.name,
+            )
+            if behind < max(SYNC_MIN_CORRECTION_S, settings.min_adjust_ms / 1000):
+                continue
+            if behind > SYNC_MAX_CORRECTION_S:
+                # too far out to be drift; a restart lines it up again
+                continue
+            if now < self._sync_hold_off_until.get(client.player_id, 0.0):
+                continue
+            skip_ms = round(behind * 1000)
+            self._sync_hold_off_until[client.player_id] = now + SYNC_SKIP_COOLDOWN_S
+            self.logger.debug(
+                "%s is %d ms behind %s: skipAhead", client.name, skip_ms, reference_client.name
+            )
+            self.mass.create_task(client.skip_over(skip_ms))
 
+    def _handle_output_underrun(self) -> None:
+        """Route an output underrun to the sync leader; solo players recover on their own."""
+        if leader_id := self.synced_to:
+            leader = cast("SqueezelitePlayer | None", self.mass.players.get_player(leader_id))
+            if leader:
+                leader.handle_member_output_underrun(self.player_id)
+        elif self.group_members:
+            self.handle_member_output_underrun(self.player_id)
 
-async def pause_and_unpause(slim_client: SlimClient, pause_duration_ms: int) -> None:
-    """
-    Pause player and schedule unpause after specified duration.
+    async def _wait_for_members_buffer_ready(self) -> None:
+        """Wait until every sync client reports its buffer ready, bounded by a timeout."""
+        deadline = time.time() + BUFFER_READY_TIMEOUT_S
+        while time.time() < deadline:
+            await asyncio.sleep(0.2)
+            if all(
+                client.state == SlimPlayerState.BUFFER_READY for client in self._get_sync_clients()
+            ):
+                return
+        # Lyrion waits forever; a stuck member must never keep the others silent here
+        self.logger.debug("Not every member of %s buffered in time, starting anyway", self.name)
 
-    This is used instead of pause_for because WiiM devices
-    don't properly auto-unpause after pause_for interval.
-    """
-    await slim_client.pause()
-    unpause_timestamp = slim_client.jiffies + pause_duration_ms
-    await slim_client.unpause_at(unpause_timestamp)
+    def _group_start_time(self) -> float:
+        """Return the shared server time the group starts at (Lyrion's _syncStart)."""
+        delays = [
+            self._sync_settings(client.player_id).play_delay_ms
+            for client in self._get_sync_clients()
+        ]
+        # the member with the largest delay starts first; the others follow it
+        lead_s = max([*delays, 0]) / 1000 + self._provider.sync_start_delay_ms / 1000
+        return time.time() + min(lead_s, SYNC_START_MAX_LEAD_S)
+
+    async def _start_group_at(self, start_time: float) -> None:
+        """Arm every sync client to start at the shared instant, shifted by its own delay."""
+        latest = time.time() + SYNC_START_MAX_LEAD_S
+        async with TaskManager(self.mass) as tg:
+            for client in self._get_sync_clients():
+                delay_s = self._sync_settings(client.player_id).play_delay_ms / 1000
+                # a positive delay starts this player earlier (Lyrion's playDelay), a negative
+                # one later, but never past the point where squeezelite starts at once
+                client_start = min(start_time - delay_s, latest)
+                self._sync_hold_off_until[client.player_id] = start_time + SYNC_START_HOLD_OFF_S
+                tg.create_task(self._start_client_at(client, client_start))
+        self.logger.debug("Group %s starts at %.3f", self.name, start_time)
+
+    async def _start_client_at(self, client: SlimClient, start_time: float) -> None:
+        """Schedule one client's start, falling back to an immediate start without a clock."""
+        try:
+            await client.start_at(start_time)
+        except PlayerClockUnknown:
+            self.logger.debug("%s has not reported its clock yet, starting it now", client.name)
+            await client.unpause_at(client.jiffies)
+
+    def _sync_settings(self, player_id: str) -> SyncSettings:
+        """Return the sync tuning of a (member) player."""
+        get_value = self.mass.config.get_raw_player_config_value
+        return SyncSettings(
+            play_delay_ms=get_value(player_id, CONF_SYNC_ADJUST, 0),
+            maintain=get_value(player_id, CONF_SYNC_MAINTAIN, default=True),
+            min_adjust_ms=get_value(player_id, CONF_SYNC_MIN_ADJUST_MS, DEFAULT_SYNC_MIN_ADJUST_MS),
+        )

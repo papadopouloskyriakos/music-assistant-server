@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-from collections import deque
 from collections.abc import AsyncIterator
-from typing import cast
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import pytest
+from aioslimproto.errors import PlayerClockUnknown
 from aioslimproto.models import PlayerState as SlimPlayerState
 from music_assistant_models.enums import MediaType, PlaybackState, RepeatMode
 from music_assistant_models.player import PlayerMedia
@@ -21,18 +20,15 @@ from music_assistant.constants import (
     CONF_SYNC_ADJUST,
 )
 from music_assistant.providers.squeezelite.constants import (
-    CONF_SYNC_JUMP_IGNORE_MS,
-    CONF_SYNC_MAX_SKIP_AHEAD_MS,
+    CONF_SYNC_MAINTAIN,
     CONF_SYNC_MIN_ADJUST_MS,
-    CONF_SYNC_PLAYPOINTS,
-    DEVIATION_JUMP_IGNORE,
-    MAX_SKIP_AHEAD_MS,
-    MIN_DEVIATION_ADJUST,
-    MIN_REQ_PLAYPOINTS,
-    SyncPlayPoint,
+    CONF_SYNC_PACKET_LATENCY_MS,
+    DEFAULT_SYNC_MIN_ADJUST_MS,
+    DEFAULT_SYNC_PACKET_LATENCY_MS,
+    SYNC_CATEGORY,
 )
 from music_assistant.providers.squeezelite.player import SqueezelitePlayer, is_protocol_only_device
-from tests.common import scheduled_call, use_real_create_task
+from tests.common import use_real_create_task
 
 
 async def test_squeezelite_prefers_wav_for_live_sources_by_default() -> None:
@@ -220,6 +216,7 @@ async def test_grouped_play_media_passes_per_member_mime_type() -> None:
     player._player_id = "leader"
     player._attr_group_members = ["leader", "member_flac", "member_mp3"]
     player.multi_client_stream = None
+    player._sync_hold_off_until = {}
     use_real_create_task(mass)
 
     mass.player_queues.get_item.return_value = None
@@ -266,6 +263,7 @@ async def test_regroup_supersedes_pending_resume() -> None:
     player._player_id = "leader"
     player._attr_group_members = ["leader", "member"]
     player._attr_playback_state = PlaybackState.PLAYING
+    player._sync_hold_off_until = {}
     use_real_create_task(mass)
     member = MagicMock()
     member.player_id = "member"
@@ -295,54 +293,73 @@ async def test_regroup_supersedes_pending_resume() -> None:
     assert resumed == ["leader"]
 
 
+NOW = 1_700_000_000.0
+
+
 async def _no_items(*_args: object, **_kwargs: object) -> AsyncIterator[object]:
     return
     yield  # pragma: no cover - makes this an async generator
 
 
-def _synced_member_player(
-    *,
-    min_adjust_ms: int = MIN_DEVIATION_ADJUST,
-    playpoints: int = MIN_REQ_PLAYPOINTS,
-    jump_ignore_ms: int = DEVIATION_JUMP_IGNORE,
-    max_skip_ahead_ms: int = MAX_SKIP_AHEAD_MS,
-) -> tuple[SqueezelitePlayer, MagicMock, MagicMock]:
-    """Return a playing sync member with the given tuning, its leader client and the mocked mass."""
+def _group_leader(
+    members: dict[str, dict[str, object]],
+) -> tuple[SqueezelitePlayer, dict[str, MagicMock], MagicMock]:
+    """
+    Return a sync leader "leader" with mocked slimproto clients for it and its members.
+
+    Each member spec may carry config values (sync_adjust, sync_maintain,
+    sync_min_adjust_ms) and client facts (state, apparent_start, measured_at, playpoint).
+    """
     player, mass = _player_with_mocked_mass()
     player.logger = MagicMock()
     player._config = MagicMock()
     player._cache = {}  # backs the cached display_name property
-    player.client = MagicMock(player_id="member", state=SlimPlayerState.PLAYING, elapsed_seconds=10)
-    player.client.name = "Member"
-    leader = MagicMock(player_id="leader", state=SlimPlayerState.PLAYING, elapsed_seconds=10)
-    leader.name = "Leader"
-    player._provider = MagicMock()
-    player._provider.slimproto.get_player.return_value = leader
-    player._sync_playpoints = deque(maxlen=playpoints)
-    player._do_not_resync_before = 0.0
-    player._sync_min_adjust_ms = min_adjust_ms
-    player._sync_jump_ignore_ms = jump_ignore_ms
-    player._sync_max_skip_ahead_ms = max_skip_ahead_ms
-    return player, leader, mass
+    player._attr_name = "leader"
+    player._player_id = "leader"
+    player._attr_group_members = ["leader", *[pid for pid in members if pid != "leader"]]
+    player._sync_hold_off_until = {}
+    player._last_sync_check = 0.0
+    player.multi_client_stream = None
+    player._provider = MagicMock(sync_start_delay_ms=200)
+    clients: dict[str, MagicMock] = {}
+    config: dict[tuple[str, str], object] = {}
+    for player_id, spec in members.items():
+        client = MagicMock(player_id=player_id, state=spec.get("state", SlimPlayerState.PLAYING))
+        client.name = player_id
+        client.playpoint = (
+            MagicMock(
+                apparent_start_time=spec.get("apparent_start", NOW - 10),
+                measured_at=spec.get("measured_at", NOW - 0.5),
+            )
+            if spec.get("playpoint", True)
+            else None
+        )
+        client.start_at = AsyncMock()
+        client.unpause_at = AsyncMock()
+        client.stop = AsyncMock()
+        client.skip_over = MagicMock()
+        clients[player_id] = client
+        for key in (CONF_SYNC_ADJUST, CONF_SYNC_MAINTAIN, CONF_SYNC_MIN_ADJUST_MS):
+            if key in spec:
+                config[(player_id, key)] = spec[key]
+    player.client = clients["leader"]
+    player._provider.slimproto.get_player.side_effect = lambda pid: clients[pid]
+    mass.config.get_raw_player_config_value.side_effect = lambda pid, key, default=None: config.get(
+        (pid, key), default
+    )
+    return player, clients, mass
 
 
-def _feed_heartbeats(player: SqueezelitePlayer, leader: MagicMock, diffs: list[int]) -> None:
-    """Run the sync check once per diff, the member reporting that many ms behind the leader."""
-    pending = list(diffs)
+def _frozen_clock(*values: float) -> MagicMock:
+    """Return a time module stand-in whose time() yields the values, then repeats the last."""
+    sequence = list(values)
 
-    def _corrected(client: MagicMock) -> int:
-        if client is leader:
-            return 10_000 + pending[0]
-        return 10_000
+    def _time() -> float:
+        if len(sequence) > 1:
+            return sequence.pop(0)
+        return sequence[0]
 
-    provider = cast("MagicMock", player._provider)
-    provider.get_corrected_elapsed_milliseconds.side_effect = _corrected
-    with patch.object(
-        SqueezelitePlayer, "synced_to", new_callable=PropertyMock, return_value="leader"
-    ):
-        while pending:
-            player._handle_sync()
-            pending.pop(0)
+    return MagicMock(time=_time)
 
 
 async def test_sync_adjust_range_is_widened_for_squeezelite_only() -> None:
@@ -355,21 +372,24 @@ async def test_sync_adjust_range_is_widened_for_squeezelite_only() -> None:
     entry = next(entry for entry in entries if entry.key == CONF_SYNC_ADJUST)
 
     assert entry.range == (-5000, 5000)
+    assert entry.category == SYNC_CATEGORY
+    assert entry.requires_reload is False
+    assert entry.immediate_apply is True
     # the shared entry, used by other providers, is untouched
     assert CONF_ENTRY_SYNC_ADJUST.range == (-500, 500)
+    assert CONF_ENTRY_SYNC_ADJUST.requires_reload is True
 
 
 @pytest.mark.parametrize(
     ("key", "default"),
     [
-        (CONF_SYNC_MIN_ADJUST_MS, MIN_DEVIATION_ADJUST),
-        (CONF_SYNC_PLAYPOINTS, MIN_REQ_PLAYPOINTS),
-        (CONF_SYNC_JUMP_IGNORE_MS, DEVIATION_JUMP_IGNORE),
-        (CONF_SYNC_MAX_SKIP_AHEAD_MS, MAX_SKIP_AHEAD_MS),
+        (CONF_SYNC_MAINTAIN, True),
+        (CONF_SYNC_MIN_ADJUST_MS, DEFAULT_SYNC_MIN_ADJUST_MS),
+        (CONF_SYNC_PACKET_LATENCY_MS, DEFAULT_SYNC_PACKET_LATENCY_MS),
     ],
 )
-async def test_sync_tuning_entries_default_to_the_former_constants(key: str, default: int) -> None:
-    """The per-player tuning entries default to the values that used to be hardcoded."""
+async def test_sync_entries_apply_live(key: str, default: object) -> None:
+    """The per-player sync entries have Lyrion's defaults and apply without a restart."""
     player, mass = _player_with_mocked_mass()
     mass.music.playlists.iter_library_items = _no_items
     mass.music.radio.iter_library_items = _no_items
@@ -380,17 +400,16 @@ async def test_sync_tuning_entries_default_to_the_former_constants(key: str, def
     assert entry.default_value == default
     assert entry.advanced is True
     assert entry.requires_reload is False
-    assert entry.category == "protocol_generic"
+    assert entry.category == SYNC_CATEGORY
 
 
-async def test_on_config_updated_resizes_the_playpoint_window() -> None:
-    """A changed measurement count rebuilds the playpoint window and keeps the newest points."""
+async def test_on_config_updated_pushes_packet_latency_to_the_client() -> None:
+    """The configured status packet latency is handed to the slimproto client."""
     player, _mass = _player_with_mocked_mass()
-    values = {CONF_SYNC_PLAYPOINTS: 4, CONF_SYNC_MIN_ADJUST_MS: 30}
+    player.client = MagicMock()
     player._config = MagicMock()
-    player._config.get_value.side_effect = lambda key, default=None: values.get(key, default)
-    player._sync_playpoints = deque(
-        (SyncPlayPoint(float(index), "leader", index) for index in range(6)), maxlen=8
+    player._config.get_value.side_effect = lambda key, default=None: (
+        7 if key == CONF_SYNC_PACKET_LATENCY_MS else default
     )
     with (
         patch.object(player, "_set_preset_items", AsyncMock()),
@@ -398,66 +417,289 @@ async def test_on_config_updated_resizes_the_playpoint_window() -> None:
     ):
         await player.on_config_updated()
 
-    assert player._sync_playpoints.maxlen == 4
-    assert [point.diff for point in player._sync_playpoints] == [2, 3, 4, 5]
-    assert player._sync_min_adjust_ms == 30
-    assert player._sync_jump_ignore_ms == DEVIATION_JUMP_IGNORE
-    assert player._sync_max_skip_ahead_ms == MAX_SKIP_AHEAD_MS
+    assert player.client.packet_latency_ms == 7
 
 
-def test_handle_sync_zero_max_skip_ahead_never_pauses_the_leader() -> None:
-    """With the maximum skip-ahead disabled a far-behind member catches up by itself."""
-    player, leader, mass = _synced_member_player(max_skip_ahead_ms=0)
+async def test_group_start_is_scheduled_on_one_shared_instant_with_per_player_delay() -> None:
+    """Every member starts at the same instant, shifted earlier by its own delay."""
+    player, clients, _mass = _group_leader(
+        {
+            "leader": {"state": SlimPlayerState.BUFFER_READY},
+            "m1": {"state": SlimPlayerState.BUFFER_READY, CONF_SYNC_ADJUST: 2000},
+            "m2": {"state": SlimPlayerState.BUFFER_READY, CONF_SYNC_ADJUST: -300},
+        }
+    )
+    use_real_create_task(_mass)
+    with (
+        patch.object(SqueezelitePlayer, "synced_to", new_callable=PropertyMock, return_value=None),
+        patch("music_assistant.providers.squeezelite.player.time", _frozen_clock(NOW)),
+        patch("music_assistant.providers.squeezelite.player.asyncio.sleep", AsyncMock()),
+    ):
+        await player._handle_buffer_ready()
 
-    _feed_heartbeats(player, leader, [2000] * MIN_REQ_PLAYPOINTS)
+    # lead = largest delay (2.0 s) + 200 ms headroom
+    assert clients["leader"].start_at.await_args.args[0] == pytest.approx(NOW + 2.2)
+    assert clients["m1"].start_at.await_args.args[0] == pytest.approx(NOW + 0.2)
+    assert clients["m2"].start_at.await_args.args[0] == pytest.approx(NOW + 2.5)
+    assert all(hold == pytest.approx(NOW + 4.2) for hold in player._sync_hold_off_until.values())
 
-    player.client.skip_over.assert_called_once_with(2000)
+
+async def test_group_start_still_arms_a_member_that_never_buffered() -> None:
+    """A member stuck buffering does not keep the others silent: all are started anyway."""
+    player, clients, _mass = _group_leader(
+        {
+            "leader": {"state": SlimPlayerState.BUFFER_READY},
+            "m1": {"state": SlimPlayerState.BUFFERING},
+        }
+    )
+    # the deadline is computed at NOW; the next reading is already past it
+    use_real_create_task(_mass)
+    with (
+        patch.object(SqueezelitePlayer, "synced_to", new_callable=PropertyMock, return_value=None),
+        patch("music_assistant.providers.squeezelite.player.time", _frozen_clock(NOW, NOW + 9)),
+        patch("music_assistant.providers.squeezelite.player.asyncio.sleep", AsyncMock()),
+    ):
+        await player._handle_buffer_ready()
+
+    clients["leader"].start_at.assert_awaited_once()
+    clients["m1"].start_at.assert_awaited_once()
+
+
+async def test_group_start_never_schedules_beyond_the_squeezelite_limit() -> None:
+    """No start is scheduled further ahead than squeezelite honours."""
+    player, clients, _mass = _group_leader(
+        {
+            "leader": {"state": SlimPlayerState.BUFFER_READY},
+            "m1": {"state": SlimPlayerState.BUFFER_READY, CONF_SYNC_ADJUST: 5000},
+            "m2": {"state": SlimPlayerState.BUFFER_READY, CONF_SYNC_ADJUST: -5000},
+        }
+    )
+    use_real_create_task(_mass)
+    with (
+        patch.object(SqueezelitePlayer, "synced_to", new_callable=PropertyMock, return_value=None),
+        patch("music_assistant.providers.squeezelite.player.time", _frozen_clock(NOW)),
+        patch("music_assistant.providers.squeezelite.player.asyncio.sleep", AsyncMock()),
+    ):
+        await player._handle_buffer_ready()
+
+    starts = [client.start_at.await_args.args[0] for client in clients.values()]
+    assert max(starts) <= NOW + 9.0
+    assert clients["m1"].start_at.await_args.args[0] == pytest.approx(NOW + 0.2)
+
+
+async def test_group_start_falls_back_to_an_immediate_start_without_a_clock() -> None:
+    """A member whose clock is unknown is started at once instead of being left silent."""
+    player, clients, _mass = _group_leader(
+        {
+            "leader": {"state": SlimPlayerState.BUFFER_READY},
+            "m1": {"state": SlimPlayerState.BUFFER_READY},
+        }
+    )
+    clients["m1"].start_at.side_effect = PlayerClockUnknown
+    clients["m1"].jiffies = 4321
+    use_real_create_task(_mass)
+    with (
+        patch.object(SqueezelitePlayer, "synced_to", new_callable=PropertyMock, return_value=None),
+        patch("music_assistant.providers.squeezelite.player.time", _frozen_clock(NOW)),
+        patch("music_assistant.providers.squeezelite.player.asyncio.sleep", AsyncMock()),
+    ):
+        await player._handle_buffer_ready()
+
+    clients["m1"].unpause_at.assert_awaited_once_with(4321)
+    clients["leader"].unpause_at.assert_not_awaited()
+
+
+async def test_solo_buffer_ready_is_unchanged() -> None:
+    """A player outside any group starts as soon as its buffer is ready."""
+    player, clients, _mass = _group_leader({"leader": {"state": SlimPlayerState.BUFFER_READY}})
+    player._attr_group_members = []
+    clients["leader"].jiffies = 1234
+    with patch.object(SqueezelitePlayer, "synced_to", new_callable=PropertyMock, return_value=None):
+        await player._handle_buffer_ready()
+
+    clients["leader"].unpause_at.assert_awaited_once_with(1234)
+    clients["leader"].start_at.assert_not_awaited()
+
+
+def _run_sync_check(player: SqueezelitePlayer, now: float = NOW) -> None:
+    """Run the leader's sync check at the given server time."""
+    with patch("music_assistant.providers.squeezelite.player.time", _frozen_clock(now)):
+        player._check_group_sync()
+
+
+def test_group_sync_skips_members_behind_the_most_ahead_player() -> None:
+    """Members behind the player furthest ahead skip forward; that player is left alone."""
+    player, clients, _mass = _group_leader(
+        {
+            "leader": {"apparent_start": 100.0},
+            "m1": {"apparent_start": 100.5},
+            "m2": {"apparent_start": 99.9},
+        }
+    )
+
+    _run_sync_check(player)
+
+    clients["leader"].skip_over.assert_called_once_with(100)
+    clients["m1"].skip_over.assert_called_once_with(600)
+    clients["m2"].skip_over.assert_not_called()
+
+
+def test_group_sync_applies_the_leaders_own_play_delay() -> None:
+    """The leader is just another member: its own delay correction applies to it too."""
+    player, clients, _mass = _group_leader(
+        {
+            "leader": {"apparent_start": 100.0, CONF_SYNC_ADJUST: 300},
+            "m1": {"apparent_start": 100.0},
+        }
+    )
+
+    _run_sync_check(player)
+
+    clients["leader"].skip_over.assert_called_once_with(300)
+    clients["m1"].skip_over.assert_not_called()
+
+
+def test_group_sync_respects_min_adjust_and_maintain() -> None:
+    """Drift under a member's minimum is left alone; an unmaintained member is ignored."""
+    player, clients, _mass = _group_leader(
+        {
+            "leader": {"apparent_start": 100.0},
+            "m1": {"apparent_start": 100.02, CONF_SYNC_MIN_ADJUST_MS: 30},
+            # furthest ahead, but not maintained: neither reference nor corrected
+            "m2": {"apparent_start": 99.0, CONF_SYNC_MAINTAIN: False},
+        }
+    )
+
+    _run_sync_check(player)
+
+    for client in clients.values():
+        client.skip_over.assert_not_called()
+
+
+@pytest.mark.parametrize("spec", [{"playpoint": False}, {"measured_at": NOW - 7}])
+def test_group_sync_aborts_on_a_stale_or_missing_playpoint(spec: dict[str, object]) -> None:
+    """Without a fresh play point from every member no correction is sent at all."""
+    player, clients, _mass = _group_leader(
+        {
+            "leader": {"apparent_start": 100.0},
+            "m1": {"apparent_start": 100.0, **spec},
+            "m2": {"apparent_start": 101.0},
+        }
+    )
+
+    _run_sync_check(player)
+
+    for client in clients.values():
+        client.skip_over.assert_not_called()
+
+
+def test_group_sync_ignores_deltas_over_ten_seconds() -> None:
+    """A member that far out is not drifting; a restart lines it up again."""
+    player, clients, _mass = _group_leader(
+        {"leader": {"apparent_start": 100.0}, "m1": {"apparent_start": 111.0}}
+    )
+
+    _run_sync_check(player)
+
+    clients["m1"].skip_over.assert_not_called()
+
+
+def test_group_sync_honours_cooldown_and_rate_limit() -> None:
+    """Checks run at most about once a second and a corrected member gets a cooldown."""
+    player, clients, _mass = _group_leader(
+        {"leader": {"apparent_start": 100.0}, "m1": {"apparent_start": 100.6}}
+    )
+
+    _run_sync_check(player, NOW)
+    assert clients["m1"].skip_over.call_count == 1
+    _run_sync_check(player, NOW + 0.5)  # rate limited
+    assert clients["m1"].skip_over.call_count == 1
+    _run_sync_check(player, NOW + 1.5)  # cooldown passed, still behind
+    assert clients["m1"].skip_over.call_count == 2
+
+
+def test_group_sync_runs_from_the_leaders_heartbeat_only() -> None:
+    """A member's heartbeat never runs the group check; the leader's does."""
+    player, _clients, _mass = _group_leader({"leader": {}, "m1": {}})
+    player._attr_playback_state = PlaybackState.PLAYING
+    player._attr_elapsed_time_last_updated = 0.0
+    player.client.elapsed_seconds = 5.0
+    with (
+        patch.object(
+            SqueezelitePlayer,
+            "state",
+            new_callable=PropertyMock,
+            return_value=MagicMock(corrected_elapsed_time=5.0),
+        ),
+        patch.object(player, "_check_group_sync") as check,
+    ):
+        player._handle_player_heartbeat()
+        check.assert_called_once()
+        player._attr_group_members = []
+        player._handle_player_heartbeat()
+        check.assert_called_once()
+
+
+def test_member_underrun_clears_its_hold_off() -> None:
+    """A member that ran dry is corrected on the next check instead of waiting out a cooldown."""
+    leader, _clients, mass = _group_leader({"leader": {}, "m1": {}})
+    leader._sync_hold_off_until = {"m1": NOW + 5, "leader": NOW + 5}
+    member, member_mass = _player_with_mocked_mass()
+    member._player_id = "m1"
+    member.logger = MagicMock()
+    member._attr_group_members = []
+    member_mass.players.get_player.return_value = leader
+    with patch.object(
+        SqueezelitePlayer, "synced_to", new_callable=PropertyMock, return_value="leader"
+    ):
+        member._handle_output_underrun()
+
+    assert "m1" not in leader._sync_hold_off_until
+    assert leader._sync_hold_off_until["leader"] == NOW + 5
+    assert mass.create_task.call_count == 0
+
+
+async def test_removing_a_member_does_not_restart_the_group() -> None:
+    """A member leaving a playing group is stopped; the others play on uninterrupted."""
+    player, clients, mass = _group_leader({"leader": {}, "m1": {}, "m2": {}})
+    player._attr_playback_state = PlaybackState.PLAYING
+    player._sync_hold_off_until = {"m1": NOW + 5}
+    with (
+        patch.object(SqueezelitePlayer, "synced_to", new_callable=PropertyMock, return_value=None),
+        patch.object(
+            SqueezelitePlayer,
+            "state",
+            new_callable=PropertyMock,
+            return_value=MagicMock(current_media=MagicMock()),
+        ),
+        patch.object(player, "update_state"),
+    ):
+        await player.set_members(player_ids_to_remove=["m1"])
+
+    clients["m1"].stop.assert_awaited_once()
+    assert player._attr_group_members == ["leader", "m2"]
+    assert "m1" not in player._sync_hold_off_until
+    mass.create_task.assert_not_called()
+
+
+async def test_adding_a_member_restarts_the_group() -> None:
+    """A member joining a playing group still restarts it (no late join into a stream)."""
+    player, _clients, mass = _group_leader({"leader": {}, "m1": {}})
+    player._attr_playback_state = PlaybackState.PLAYING
+    joiner = MagicMock(state=SlimPlayerState.STOPPED)
+    mass.players.get_player.return_value = joiner
+    with (
+        patch.object(SqueezelitePlayer, "synced_to", new_callable=PropertyMock, return_value=None),
+        patch.object(
+            SqueezelitePlayer,
+            "state",
+            new_callable=PropertyMock,
+            return_value=MagicMock(current_media=MagicMock()),
+        ),
+        patch.object(player, "update_state"),
+    ):
+        await player.set_members(player_ids_to_add=["m3"])
+
+    assert player._attr_group_members == ["leader", "m1", "m3"]
+    mass.players.cmd_resume.assert_called_once_with("leader")
     mass.create_task.assert_called_once()
-
-
-def test_handle_sync_pauses_the_leader_above_max_skip_ahead() -> None:
-    """A member lagging more than the maximum skip-ahead makes the leader wait for it."""
-    player, leader, mass = _synced_member_player(max_skip_ahead_ms=800)
-
-    _feed_heartbeats(player, leader, [2000] * MIN_REQ_PLAYPOINTS)
-
-    player.client.skip_over.assert_not_called()
-    name, arguments = scheduled_call(mass.create_task.call_args.args[0])
-    assert name == "pause_and_unpause"
-    assert arguments["slim_client"] is leader
-    assert arguments["pause_duration_ms"] == 2000
-
-
-@pytest.mark.parametrize(("min_adjust_ms", "corrected"), [(30, False), (8, True)])
-def test_handle_sync_respects_the_configured_minimum(min_adjust_ms: int, corrected: bool) -> None:
-    """Drift below the configured minimum is left alone, drift above it is corrected."""
-    player, leader, _mass = _synced_member_player(min_adjust_ms=min_adjust_ms)
-
-    _feed_heartbeats(player, leader, [20] * MIN_REQ_PLAYPOINTS)
-
-    assert player.client.skip_over.called is corrected
-    if corrected:
-        player.client.skip_over.assert_called_once_with(20)
-
-
-@pytest.mark.parametrize(("jump_ignore_ms", "corrected"), [(500, False), (2000, True)])
-def test_handle_sync_ignores_jumps_above_the_configured_window(
-    jump_ignore_ms: int, corrected: bool
-) -> None:
-    """A single measurement far from the running average is ignored within the configured window."""
-    player, leader, _mass = _synced_member_player(jump_ignore_ms=jump_ignore_ms)
-
-    _feed_heartbeats(player, leader, [20] * (MIN_REQ_PLAYPOINTS - 1) + [900])
-
-    assert player.client.skip_over.called is corrected
-
-
-def test_handle_sync_waits_for_the_configured_playpoint_count() -> None:
-    """No correction is sent before the configured number of measurements is collected."""
-    player, leader, _mass = _synced_member_player(playpoints=4)
-
-    _feed_heartbeats(player, leader, [100] * 3)
-    player.client.skip_over.assert_not_called()
-
-    _feed_heartbeats(player, leader, [100])
-    player.client.skip_over.assert_called_once_with(100)

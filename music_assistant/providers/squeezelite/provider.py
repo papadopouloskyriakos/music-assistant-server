@@ -3,17 +3,17 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, cast
+from typing import cast
 
 from aiohttp import web
 from aioslimproto.models import EventType as SlimEventType
 from aioslimproto.models import SlimEvent
 from aioslimproto.server import SlimServer
-from music_assistant_models.config_entries import ConfigEntry
+from music_assistant_models.config_entries import ConfigEntry, ProviderConfig
 from music_assistant_models.enums import ConfigEntryType, MediaType
 from music_assistant_models.errors import SetupFailedError
 
-from music_assistant.constants import CONF_PORT, CONF_SYNC_ADJUST, VERBOSE_LOG_LEVEL
+from music_assistant.constants import CONF_LOG_LEVEL, CONF_PORT, VERBOSE_LOG_LEVEL
 from music_assistant.helpers.audio import get_mime_type
 from music_assistant.helpers.util import is_port_in_use
 from music_assistant.models.player_provider import PlayerProvider
@@ -22,12 +22,12 @@ from .constants import (
     CONF_CLI_JSON_PORT,
     CONF_CLI_TELNET_PORT,
     CONF_DISCOVERY,
+    CONF_ENTRY_SYNC_START_DELAY_MS,
+    CONF_SYNC_START_DELAY_MS,
     DEFAULT_SLIMPROTO_PORT,
+    DEFAULT_SYNC_START_DELAY_MS,
 )
 from .player import SqueezelitePlayer
-
-if TYPE_CHECKING:
-    from aioslimproto.client import SlimClient
 
 
 class SqueezelitePlayerProvider(PlayerProvider):
@@ -62,6 +62,7 @@ class SqueezelitePlayerProvider(PlayerProvider):
                 type=ConfigEntryType.INTEGER,
                 default_value=DEFAULT_SLIMPROTO_PORT,
             ),
+            CONF_ENTRY_SYNC_START_DELAY_MS,
         )
 
     async def handle_async_init(self) -> None:
@@ -121,12 +122,31 @@ class SqueezelitePlayerProvider(PlayerProvider):
         self.mass.streams.unregister_dynamic_route("/slimproto/multi")
         self.mass.streams.unregister_dynamic_route("/jsonrpc.js")
 
-    def get_corrected_elapsed_milliseconds(self, slimplayer: SlimClient) -> int:
-        """Return corrected elapsed milliseconds for a slimplayer."""
-        sync_delay = self.mass.config.get_raw_player_config_value(
-            slimplayer.player_id, CONF_SYNC_ADJUST, 0
+    @property
+    def sync_start_delay_ms(self) -> int:
+        """Return the headroom added to every scheduled group start, in milliseconds."""
+        return cast(
+            "int", self.config.get_value(CONF_SYNC_START_DELAY_MS, DEFAULT_SYNC_START_DELAY_MS)
         )
-        return int(slimplayer.elapsed_milliseconds - sync_delay)
+
+    async def update_config(self, config: ProviderConfig, changed_keys: set[str]) -> None:
+        """
+        Handle a config update; the sync start delay applies live, anything else reloads.
+
+        A reload restarts the slimproto server and disconnects every player, far too
+        disruptive for a value the group start reads on every use.
+
+        :param config: The updated provider config.
+        :param changed_keys: The keys that changed.
+        """
+        live_keys = {f"values/{CONF_SYNC_START_DELAY_MS}", f"values/{CONF_LOG_LEVEL}"}
+        value_keys = {key for key in changed_keys if key.startswith("values/")}
+        if value_keys and value_keys <= live_keys:
+            self.config = config
+            if f"values/{CONF_LOG_LEVEL}" in changed_keys:
+                self._set_log_level_from_config(config)
+            return
+        await super().update_config(config, changed_keys)
 
     async def _validate_all_ports(
         self, control_port: int, telnet_port: int | None, json_port: int | None

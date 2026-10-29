@@ -22,16 +22,24 @@ CONF_VISUALIZATION = "visualization"
 DEFAULT_PLAYER_VOLUME = 20
 DEFAULT_VISUALIZATION = SlimVisualisationType.NONE
 
-# sync constants: the defaults of the per-player sync tuning entries below
-MIN_DEVIATION_ADJUST = 8  # milliseconds
-MIN_REQ_PLAYPOINTS = 8  # we need at least 8 measurements
-DEVIATION_JUMP_IGNORE = 500  # ignore a sudden unrealistic jump
-MAX_SKIP_AHEAD_MS = 800  # 0.8 seconds
-
+# sync: a group starts on one shared instant and the leader keeps its members on the
+# player that is furthest ahead (the Lyrion Music Server algorithm)
+CONF_SYNC_MAINTAIN = "sync_maintain"
 CONF_SYNC_MIN_ADJUST_MS = "sync_min_adjust_ms"
-CONF_SYNC_PLAYPOINTS = "sync_playpoints"
-CONF_SYNC_JUMP_IGNORE_MS = "sync_jump_ignore_ms"
-CONF_SYNC_MAX_SKIP_AHEAD_MS = "sync_max_skip_ahead_ms"
+CONF_SYNC_PACKET_LATENCY_MS = "sync_packet_latency_ms"
+CONF_SYNC_START_DELAY_MS = "sync_start_delay_ms"
+DEFAULT_SYNC_MIN_ADJUST_MS = 8  # milliseconds
+DEFAULT_SYNC_PACKET_LATENCY_MS = 2  # milliseconds
+DEFAULT_SYNC_START_DELAY_MS = 200  # milliseconds of headroom for the start command
+SYNC_CHECK_INTERVAL_S = 0.95
+SYNC_PLAYPOINT_MAX_AGE_S = 6.0  # the 5 s heartbeat is the slowest status cadence
+SYNC_MIN_CORRECTION_S = 0.010
+SYNC_MAX_CORRECTION_S = 10.0
+SYNC_SKIP_COOLDOWN_S = 1.0
+SYNC_START_HOLD_OFF_S = 2.0
+SYNC_START_MAX_LEAD_S = 9.0  # squeezelite starts at once when told to start > 10 s ahead
+BUFFER_READY_TIMEOUT_S = 8.0
+SYNC_CATEGORY = "squeezelite_sync"
 
 STATE_MAP = {
     SlimPlayerState.BUFFERING: PlaybackState.PLAYING,
@@ -62,47 +70,53 @@ CONF_ENTRY_VISUALIZATION = ConfigEntry(
     advanced=True,
     depends_on=CONF_DISPLAY,
 )
-# squeezelite (software) players accept a far larger correction than the generic entry allows,
-# e.g. a converted speaker whose amplifier adds seconds of processing delay
-CONF_ENTRY_SYNC_ADJUST_SQUEEZELITE = replace(CONF_ENTRY_SYNC_ADJUST, range=(-5000, 5000))
+# squeezelite (software) players accept a far larger correction than the generic entry
+# allows, e.g. a converted speaker whose amplifier adds seconds of processing delay; the
+# value applies to the next scheduled start and to the running check without a restart
+CONF_ENTRY_SYNC_ADJUST_SQUEEZELITE = replace(
+    CONF_ENTRY_SYNC_ADJUST,
+    range=(-5000, 5000),
+    category=SYNC_CATEGORY,
+    requires_reload=False,
+    immediate_apply=True,
+)
+CONF_ENTRY_SYNC_MAINTAIN = ConfigEntry(
+    key=CONF_SYNC_MAINTAIN,
+    type=ConfigEntryType.BOOLEAN,
+    default_value=True,
+    category=SYNC_CATEGORY,
+    advanced=True,
+)
 CONF_ENTRY_SYNC_MIN_ADJUST_MS = ConfigEntry(
     key=CONF_SYNC_MIN_ADJUST_MS,
     type=ConfigEntryType.INTEGER,
     range=(1, 500),
-    default_value=MIN_DEVIATION_ADJUST,
-    category="protocol_generic",
+    default_value=DEFAULT_SYNC_MIN_ADJUST_MS,
+    category=SYNC_CATEGORY,
     advanced=True,
 )
-CONF_ENTRY_SYNC_PLAYPOINTS = ConfigEntry(
-    key=CONF_SYNC_PLAYPOINTS,
+CONF_ENTRY_SYNC_PACKET_LATENCY_MS = ConfigEntry(
+    key=CONF_SYNC_PACKET_LATENCY_MS,
     type=ConfigEntryType.INTEGER,
-    range=(2, 60),
-    default_value=MIN_REQ_PLAYPOINTS,
-    category="protocol_generic",
+    range=(0, 500),
+    default_value=DEFAULT_SYNC_PACKET_LATENCY_MS,
+    category=SYNC_CATEGORY,
     advanced=True,
 )
-CONF_ENTRY_SYNC_JUMP_IGNORE_MS = ConfigEntry(
-    key=CONF_SYNC_JUMP_IGNORE_MS,
+CONF_ENTRY_SYNC_START_DELAY_MS = ConfigEntry(
+    key=CONF_SYNC_START_DELAY_MS,
     type=ConfigEntryType.INTEGER,
-    range=(50, 10000),
-    default_value=DEVIATION_JUMP_IGNORE,
-    category="protocol_generic",
-    advanced=True,
-)
-CONF_ENTRY_SYNC_MAX_SKIP_AHEAD_MS = ConfigEntry(
-    key=CONF_SYNC_MAX_SKIP_AHEAD_MS,
-    type=ConfigEntryType.INTEGER,
-    range=(0, 10000),
-    default_value=MAX_SKIP_AHEAD_MS,
-    category="protocol_generic",
+    range=(0, 5000),
+    default_value=DEFAULT_SYNC_START_DELAY_MS,
+    category=SYNC_CATEGORY,
     advanced=True,
 )
 
 
-@dataclass
-class SyncPlayPoint:
-    """Simple structure to describe a Sync Playpoint."""
+@dataclass(frozen=True)
+class SyncSettings:
+    """Per-player sync tuning as read from the player config."""
 
-    timestamp: float
-    sync_master: str
-    diff: int
+    play_delay_ms: int  # sync_adjust: positive plays earlier (Lyrion's playDelay)
+    maintain: bool
+    min_adjust_ms: int
