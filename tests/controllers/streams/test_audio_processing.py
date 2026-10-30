@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import array
 import asyncio
+import math
+import subprocess
 from collections.abc import AsyncGenerator
 from copy import deepcopy
 from types import SimpleNamespace
@@ -40,6 +43,7 @@ from music_assistant_models.player import PlayerMedia
 from music_assistant_models.player_queue import PlayLogEntry
 from music_assistant_models.streamdetails import StreamDetails
 
+from music_assistant.constants import CONF_OUTPUT_CHANNELS
 from music_assistant.controllers.streams.audio import StreamsAudio
 from music_assistant.controllers.streams.audio_processing import (
     AudioOutputPlan,
@@ -1013,6 +1017,100 @@ def test_player_output_plan_pans_for_the_handoff_format() -> None:
     )
 
     assert plan.filter_params == ["pan=stereo|c0=0.5*FL+0.5*FR|c1=0.5*FL+0.5*FR"]
+
+
+def _surround_plan(input_channels: int) -> AudioOutputPlan:
+    """Build the output plan of a player set to the surround channel mode."""
+    mass = MagicMock()
+    mass.players.get_player.return_value = None
+    mass.config.get_player_dsp_config.return_value = DSPConfig(enabled=False)
+    mass.config.get_raw_player_config_value.return_value = "surround"
+    audio = StreamsAudio(cast("Any", mass))
+    return audio.get_player_output_plan(
+        "player-1",
+        _format(ContentType.PCM_F32LE, 48000, 32, channels=input_channels),
+        _format(ContentType.FLAC, 48000, 16, channels=1),
+        queue_id="queue-1",
+        session_id="session-1",
+        queue_item_id="item-1",
+    )
+
+
+def test_player_output_plan_derives_the_surround_channel() -> None:
+    """The surround mode plays the band limited difference of both source channels."""
+    plan = _surround_plan(input_channels=2)
+
+    assert plan.filter_params == [
+        "pan=mono|c0=0.5*FL-0.5*FR",
+        "highpass=f=100",
+        "lowpass=f=7000",
+    ]
+    assert plan.output_details.source_channel == AudioChannel.ALL
+
+
+def test_player_output_plan_skips_the_surround_channel_for_mono_source() -> None:
+    """A single channel source holds no difference to derive, so it is left untouched."""
+    plan = _surround_plan(input_channels=1)
+
+    assert plan.filter_params == []
+    assert plan.output_details.source_channel is None
+
+
+@pytest.mark.parametrize(
+    ("source", "min_rms", "max_rms"),
+    [
+        ("sin(2*PI*1000*t)|sin(2*PI*1000*t)", 0.0, 1e-6),
+        ("sin(2*PI*1000*t)|-sin(2*PI*1000*t)", 0.6, 0.75),
+        ("sin(2*PI*30*t)|-sin(2*PI*30*t)", 0.0, 0.1),
+        ("sin(2*PI*15000*t)|-sin(2*PI*15000*t)", 0.0, 0.1),
+    ],
+    ids=["centred-cancels", "anti-phase-passes", "below-band", "above-band"],
+)
+def test_surround_filters_run_in_ffmpeg(source: str, min_rms: float, max_rms: float) -> None:
+    """FFmpeg accepts the surround filters and they shape a stereo source as intended."""
+    plan = _surround_plan(input_channels=2)
+    filter_graph = ",".join(str(param) for param in plan.filter_params)
+
+    result = subprocess.run(  # noqa: S603
+        [  # noqa: S607
+            "ffmpeg",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            f"aevalsrc={source}:s=48000:d=0.5",
+            "-af",
+            filter_graph,
+            "-f",
+            "f32le",
+            "-",
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+    samples = array.array("f", result.stdout)
+    # half a second at 48 kHz on a single channel
+    assert len(samples) == 24000
+    rms = math.sqrt(sum(sample * sample for sample in samples) / len(samples))
+    assert min_rms <= rms <= max_rms
+
+
+@pytest.mark.asyncio
+async def test_output_format_for_surround_is_mono() -> None:
+    """A player set to the surround mode is sent a single channel stream."""
+    mass = MagicMock()
+    player = MagicMock(player_id="player-1", protocol_parent_id=None)
+    player.get_supported_sample_rates.return_value = [(48000, 24)]
+    mass.config.get_raw_player_config_value.side_effect = lambda _player_id, key, default: (
+        "surround" if key == CONF_OUTPUT_CHANNELS else default
+    )
+    audio = StreamsAudio(cast("Any", mass))
+
+    fmt = await audio.get_output_format("flac", player, 48000, 24, MediaType.TRACK)
+
+    assert fmt.channels == 1
 
 
 def test_mono_downmix_prevents_bit_perfect_claim() -> None:

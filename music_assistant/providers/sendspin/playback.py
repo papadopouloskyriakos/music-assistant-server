@@ -1263,7 +1263,7 @@ class SendspinPlaybackSession:
             "stereo",
         )
         output_channels = str(raw_output_channels or "stereo").strip().lower()
-        if output_channels not in {"stereo", "left", "right", "mono"}:
+        if output_channels not in {"stereo", "left", "right", "mono", "surround"}:
             output_channels = "stereo"
         try:
             output_format = self._get_member_output_format(player_id)

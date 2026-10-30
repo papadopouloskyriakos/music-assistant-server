@@ -215,7 +215,8 @@
         "stereo": "Stereo (both channels)",
         "left": "Left channel only",
         "right": "Right channel only",
-        "mono": "Mono (both channels)"
+        "mono": "Mono (both channels)",
+        "surround": "Surround (left minus right, for rear speakers)"
       }
     },
     "output_codec": {

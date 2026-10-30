@@ -479,6 +479,7 @@ CONF_ENTRY_OUTPUT_CHANNELS = ConfigEntry(
         ConfigValueOption("left"),
         ConfigValueOption("right"),
         ConfigValueOption("mono"),
+        ConfigValueOption("surround"),
     ],
     default_value="stereo",
     category="protocol_generic",

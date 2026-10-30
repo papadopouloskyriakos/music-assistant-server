@@ -1322,6 +1322,12 @@ class StreamsAudio:
                 # output from ever being presented as bit perfect
                 source_channel = AudioChannel.ALL
                 channel_mix = "0.5*FL+0.5*FR"
+            elif channel_value == "surround":
+                # the surround channel a matrix (Dolby Surround, Pro Logic) decoder
+                # derives from a stereo mix: the difference of left and right, in which
+                # centred dialogue cancels out; band limited to 100 Hz to 7 kHz after the pan
+                source_channel = AudioChannel.ALL
+                channel_mix = "0.5*FL-0.5*FR"
         if channel_mix:
             # the pan runs in the command that emits the handoff format, and it feeds
             # every channel of it explicitly: leaving ffmpeg to upmix from a single
@@ -1330,6 +1336,8 @@ class StreamsAudio:
                 filter_params.append(f"pan=mono|c0={channel_mix}")
             else:
                 filter_params.append(f"pan=stereo|c0={channel_mix}|c1={channel_mix}")
+            if channel_value == "surround":
+                filter_params.extend(("highpass=f=100", "lowpass=f=7000"))
 
         output_details = AudioOutputDetails(
             player_ids=sorted(destination_player_ids),
