@@ -173,6 +173,9 @@ class SqueezelitePlayer(Player):
         await self.client.mute(init_muted)
         await self.client.volume_set(init_volume)
         await self.mass.players.register_or_update(self)
+        # every other player's can_group_with is a snapshot from its last state update, so
+        # until it updates again a group formed now would refuse this player
+        self._refresh_other_players()
 
     async def get_config_entries(self) -> list[ConfigEntry]:
         """Return all (provider/player specific) Config Entries for the player."""
@@ -855,3 +858,9 @@ class SqueezelitePlayer(Player):
             maintain=get_value(player_id, CONF_SYNC_MAINTAIN, default=True),
             min_adjust_ms=get_value(player_id, CONF_SYNC_MIN_ADJUST_MS, DEFAULT_SYNC_MIN_ADJUST_MS),
         )
+
+    def _refresh_other_players(self) -> None:
+        """Recompute the state of every other player, so a group can take this one at once."""
+        for player in self.mass.players.iter_players():
+            if player.player_id != self.player_id:
+                player.update_state()

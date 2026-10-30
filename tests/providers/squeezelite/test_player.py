@@ -703,3 +703,32 @@ async def test_adding_a_member_restarts_the_group() -> None:
     assert player._attr_group_members == ["leader", "m1", "m3"]
     mass.players.cmd_resume.assert_called_once_with("leader")
     mass.create_task.assert_called_once()
+
+
+async def test_setup_refreshes_the_other_players_so_a_group_can_take_the_newcomer() -> None:
+    """A player that connects is groupable at once: every other player's state is recomputed."""
+    player, mass = _player_with_mocked_mass()
+    player.client = MagicMock(player_id="new", name="new", stop=AsyncMock(), mute=AsyncMock())
+    player.client.volume_set = AsyncMock()
+    player.logger = MagicMock()
+    mass.cache.get = AsyncMock(return_value=None)
+    mass.players.register_or_update = AsyncMock()
+    others = [MagicMock(player_id="a"), MagicMock(player_id="b")]
+    itself = MagicMock(player_id="new")
+    mass.players.iter_players.return_value = [*others, itself]
+    with (
+        patch.object(SqueezelitePlayer, "player_id", new_callable=PropertyMock, return_value="new"),
+        patch.object(
+            SqueezelitePlayer,
+            "provider",
+            new_callable=PropertyMock,
+            return_value=MagicMock(instance_id="squeezelite"),
+        ),
+        patch.object(player, "update_attributes"),
+    ):
+        await player.setup()
+
+    mass.players.register_or_update.assert_awaited_once_with(player)
+    for other in others:
+        other.update_state.assert_called_once_with()
+    itself.update_state.assert_not_called()
