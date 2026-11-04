@@ -10,7 +10,7 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from functools import partial
 from typing import Any, cast
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 from music_assistant_models.constants import PLAYER_CONTROL_NONE
@@ -4072,3 +4072,205 @@ class TestNextTrackHandoverLocksTheLeader:
         await sgp.enqueue_next_media(MagicMock())
 
         mass.players._handle_enqueue_next_media.assert_not_awaited()
+
+
+def _noop_lock() -> AsyncMock:
+    """Return an async context manager that does nothing."""
+    lock_ctx = AsyncMock()
+    lock_ctx.__aenter__.return_value = None
+    lock_ctx.__aexit__.return_value = False
+    return lock_ctx
+
+
+class TestSyncLeaderLoss:
+    """A sync leader that drops off the network moves the group to the remaining members."""
+
+    def _setup_group(
+        self, mass: MagicMock, state: PlaybackState = PlaybackState.PLAYING
+    ) -> tuple[SyncGroupPlayer, dict[str, MagicMock]]:
+        sgp = _make_sync_group(mass)
+        players = {
+            member_id: _make_mock_player(member_id, provider_domain="wiim", playback_state=state)
+            for member_id in ("leader", "m2", "m3")
+        }
+        players["m2"].state.can_group_with = {"m3"}
+        mass.players.get_player = _player_lookup(players)
+        sgp.sync_leader = players["leader"]
+        sgp._attr_group_members = ["leader", "m2", "m3"]
+        sgp._attr_playback_state = state
+        mass.create_task = MagicMock(
+            side_effect=lambda coro, *_a, **_k: asyncio.Task(
+                coro, loop=asyncio.get_running_loop(), eager_start=True
+            )
+        )
+        return sgp, players
+
+    @staticmethod
+    def _lose_leader(players: dict[str, MagicMock], mass: MagicMock) -> MagicMock:
+        """Unregister the leader the way the controller does when its connection drops."""
+        leader = players.pop("leader")
+        leader.available = False
+        leader.state.available = False
+        mass.players.get_player = _player_lookup(players)
+
+        def _fail_for_leader(player_id: str) -> None:
+            if player_id == "leader":
+                raise PlayerUnavailableError(player_id)
+
+        mass.players._handle_cmd_stop.side_effect = _fail_for_leader
+        return leader
+
+    @pytest.mark.asyncio
+    async def test_present_leader_is_left_alone(self) -> None:
+        """A registered, available leader starts no hand-over."""
+        mass = _make_mock_mass()
+        sgp, players = self._setup_group(mass)
+
+        with patch.object(sgp, "update_state"):
+            await sgp.poll()
+
+        assert sgp._leader_loss_task is None
+        assert sgp.sync_leader is players["leader"]
+        mass.players._handle_cmd_stop.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unregistered_leader_reforms_and_resumes(self) -> None:
+        """A playing group whose leader was unregistered re-forms on the others and resumes."""
+        mass = _make_mock_mass()
+        sgp, players = self._setup_group(mass)
+        self._lose_leader(players, mass)
+
+        with (
+            patch("music_assistant.providers.sync_group.player.REFORM_DEBOUNCE_SECONDS", 0.05),
+            patch.object(sgp, "update_state"),
+            patch.object(sgp, "play", new=AsyncMock()) as play,
+        ):
+            await sgp.poll()
+            task = sgp._leader_loss_task
+            assert task is not None
+            await task
+
+            mass.players._handle_cmd_stop.assert_any_await("leader")
+            assert sgp.sync_leader is None
+            assert sgp._attr_group_members == ["m2", "m3"]
+            assert sgp._leader_loss_task is None or sgp._leader_loss_task.done()
+            reform = sgp._reform_task
+            assert reform is not None
+            await reform
+
+        play.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_reconnected_leader_object_counts_as_lost(self) -> None:
+        """A leader that reconnected is a new object; the group lets go of the stale one."""
+        mass = _make_mock_mass()
+        sgp, players = self._setup_group(mass)
+        stale = players["leader"]
+        stale.state.available = False
+        players["leader"] = _make_mock_player("leader", provider_domain="wiim")
+        mass.players.get_player = _player_lookup(players)
+
+        with (
+            patch("music_assistant.providers.sync_group.player.REFORM_DEBOUNCE_SECONDS", 0.05),
+            patch.object(sgp, "update_state"),
+            patch.object(sgp, "play", new=AsyncMock()) as play,
+        ):
+            await sgp.poll()
+            task = sgp._leader_loss_task
+            assert task is not None
+            await task
+            assert sgp.sync_leader is None
+            reform = sgp._reform_task
+            assert reform is not None
+            await reform
+
+        play.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_lost_leader_of_paused_group_dissolves_without_resume(self) -> None:
+        """A paused group is dissolved, never restarted, when its leader is lost."""
+        mass = _make_mock_mass()
+        sgp, players = self._setup_group(mass, state=PlaybackState.PAUSED)
+        self._lose_leader(players, mass)
+
+        with (
+            patch.object(sgp, "update_state"),
+            patch.object(sgp, "play", new=AsyncMock()) as play,
+        ):
+            await sgp.poll()
+            task = sgp._leader_loss_task
+            assert task is not None
+            await task
+
+        assert sgp.sync_leader is None
+        assert sgp._reform_task is None
+        play.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_one_hand_over_at_a_time(self) -> None:
+        """Polls during a running hand-over start no second one."""
+        mass = _make_mock_mass()
+        sgp, players = self._setup_group(mass)
+        self._lose_leader(players, mass)
+        release = asyncio.Event()
+
+        async def _slow_dissolve(*_args: object, **_kwargs: object) -> None:
+            await release.wait()
+
+        with (
+            patch.object(sgp, "update_state"),
+            patch.object(
+                sgp, "_dissolve_and_reform", new=AsyncMock(side_effect=_slow_dissolve)
+            ) as dissolve,
+        ):
+            await sgp.poll()
+            task = sgp._leader_loss_task
+            assert task is not None
+            await sgp.poll()
+            await sgp.poll()
+            release.set()
+            await task
+
+        dissolve.assert_awaited_once_with("leader", leader_to_stop=ANY, resume_playback=True)
+        assert sgp._leader_loss_task is None
+
+    @pytest.mark.asyncio
+    async def test_hand_over_skipped_when_the_group_moved_on(self) -> None:
+        """A stop or ungroup that replaced the leader first leaves nothing to hand over."""
+        mass = _make_mock_mass()
+        sgp, players = self._setup_group(mass)
+        self._lose_leader(players, mass)
+        lock_ctx = AsyncMock()
+
+        async def _enter() -> None:
+            # another command dissolved the group while we waited for its lock
+            sgp.sync_leader = None
+
+        lock_ctx.__aenter__.side_effect = _enter
+        lock_ctx.__aexit__.return_value = False
+        mass.players.get_player_lock = MagicMock(return_value=lock_ctx)
+
+        with (
+            patch.object(sgp, "update_state"),
+            patch.object(sgp, "_dissolve_and_reform", new=AsyncMock()) as dissolve,
+        ):
+            await sgp.poll()
+            task = sgp._leader_loss_task
+            assert task is not None
+            await task
+
+        dissolve.assert_not_awaited()
+        # the finished runner does not block the next loss
+        sgp.sync_leader = players["m2"]
+        players.pop("m2")
+        mass.players.get_player_lock = MagicMock(return_value=_noop_lock())
+        with (
+            patch.object(sgp, "update_state"),
+            patch.object(sgp, "_dissolve_and_reform", new=AsyncMock()) as dissolve,
+        ):
+            await sgp.poll()
+            task = sgp._leader_loss_task
+            assert task is not None
+            await task
+
+        dissolve.assert_awaited_once()

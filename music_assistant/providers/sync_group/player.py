@@ -75,6 +75,8 @@ class SyncGroupPlayer(Player):
         self._idle_grace_task: asyncio.Task[None] | None = None
         # task that re-forms the group (debounced) after the sync leader was removed
         self._reform_task: asyncio.Task[None] | None = None
+        # task that moves the group off a sync leader that dropped off the network
+        self._leader_loss_task: asyncio.Task[None] | None = None
         # Takeover acquired while fake power forms the group before play_media.
         self._pending_content_takeover: tuple[Player, object] | None = None
         self._preparing_play_media = False
@@ -463,6 +465,7 @@ class SyncGroupPlayer(Player):
 
     async def poll(self) -> None:
         """Poll player for state updates."""
+        self._check_sync_leader_present()
         self._update_attributes()
         self.update_state()
 
@@ -756,6 +759,7 @@ class SyncGroupPlayer(Player):
         self, member_player: Player, changed_values: dict[str, tuple[Any, Any]]
     ) -> None:
         """Handle callback when a group member of the group player is updated."""
+        self._check_sync_leader_present()
         self._update_attributes()
         super().on_group_member_updated(member_player, changed_values)
         if not self.is_dynamic and self.sync_leader is not None:
@@ -765,6 +769,9 @@ class SyncGroupPlayer(Player):
         """Handle logic when the player is unloaded from the Player controller."""
         self._cancel_idle_grace_timer()
         self._cancel_reform_timer()
+        if self._leader_loss_task is not None:
+            self._leader_loss_task.cancel()
+            self._leader_loss_task = None
         await super().on_unload()
         # the player is going away; make sure we don't leave the protocol-level
         # sync group standing with a now-nonexistent leader behind it.
@@ -1589,6 +1596,49 @@ class SyncGroupPlayer(Player):
                 self.display_name,
             )
             await self._dissolve_syncgroup()
+
+    def _check_sync_leader_present(self) -> None:
+        """Move the group off its sync leader once that leader has dropped off the network."""
+        leader = self.sync_leader
+        task = self._leader_loss_task
+        if leader is None or (task is not None and not task.done()):
+            return
+        # A provider unregisters a player it lost and registers a new object when it
+        # reconnects, so the leader we hold then gets no more updates and the group
+        # would keep mirroring its last state while the members run out of audio.
+        if self.mass.players.get_player(leader.player_id) is leader and leader.state.available:
+            return
+        self._leader_loss_task = self.mass.create_task(self._leader_loss_runner(leader))
+
+    async def _leader_loss_runner(self, lost_leader: Player) -> None:
+        """
+        Dissolve the group of a lost sync leader and re-form it on the remaining members.
+
+        :param lost_leader: The sync leader that is no longer registered or available.
+        """
+        try:
+            async with self.mass.players.get_player_lock(
+                self.player_id, PlayerLockPurpose.PLAYBACK
+            ):
+                if self.sync_leader is not lost_leader:
+                    # another path (a stop, an ungroup) moved the group on meanwhile
+                    return
+                was_playing = self._attr_playback_state == PlaybackState.PLAYING
+                self.logger.warning(
+                    "Sync leader %s of group %s dropped off the network, %s",
+                    lost_leader.display_name,
+                    self.display_name,
+                    "re-forming on the remaining members" if was_playing else "dissolving",
+                )
+                await self._dissolve_and_reform(
+                    lost_leader.player_id,
+                    leader_to_stop=lost_leader,
+                    resume_playback=was_playing,
+                )
+        finally:
+            # an eagerly started runner can finish before its task is stored
+            if self._leader_loss_task is asyncio.current_task():
+                self._leader_loss_task = None
 
     @property
     def _playback_recently_started(self) -> bool:
