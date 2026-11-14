@@ -217,6 +217,7 @@ async def test_grouped_play_media_passes_per_member_mime_type() -> None:
     player._attr_group_members = ["leader", "member_flac", "member_mp3"]
     player.multi_client_stream = None
     player._sync_hold_off_until = {}
+    player._sync_pending_skip = {}
     use_real_create_task(mass)
 
     mass.player_queues.get_item.return_value = None
@@ -264,6 +265,7 @@ async def test_regroup_supersedes_pending_resume() -> None:
     player._attr_group_members = ["leader", "member"]
     player._attr_playback_state = PlaybackState.PLAYING
     player._sync_hold_off_until = {}
+    player._sync_pending_skip = {}
     use_real_create_task(mass)
     member = MagicMock()
     member.player_id = "member"
@@ -318,6 +320,7 @@ def _group_leader(
     player._player_id = "leader"
     player._attr_group_members = ["leader", *[pid for pid in members if pid != "leader"]]
     player._sync_hold_off_until = {}
+    player._sync_pending_skip = {}
     player._last_sync_check = 0.0
     player.multi_client_stream = None
     player._provider = MagicMock(sync_start_delay_ms=200)
@@ -576,21 +579,44 @@ def test_group_sync_respects_min_adjust_and_maintain() -> None:
         client.skip_over.assert_not_called()
 
 
-@pytest.mark.parametrize("spec", [{"playpoint": False}, {"measured_at": NOW - 7}])
-def test_group_sync_aborts_on_a_stale_or_missing_playpoint(spec: dict[str, object]) -> None:
-    """Without a fresh play point from every member no correction is sent at all."""
+@pytest.mark.parametrize(
+    "spec",
+    [{"playpoint": False}, {"measured_at": NOW - 7}, {"state": SlimPlayerState.STOPPED}],
+)
+def test_group_sync_leaves_out_a_member_without_a_usable_playpoint(
+    spec: dict[str, object],
+) -> None:
+    """One member without a fresh position never switches the check off for the others."""
     player, clients, _mass = _group_leader(
         {
             "leader": {"apparent_start": 100.0},
-            "m1": {"apparent_start": 100.0, **spec},
-            "m2": {"apparent_start": 101.0},
+            # furthest ahead, but unusable: neither reference nor corrected
+            "m1": {"apparent_start": 99.0, **spec},
+            "m2": {"apparent_start": 100.4},
         }
     )
 
     _run_sync_check(player)
 
-    for client in clients.values():
-        client.skip_over.assert_not_called()
+    clients["leader"].skip_over.assert_not_called()
+    clients["m1"].skip_over.assert_not_called()
+    clients["m2"].skip_over.assert_called_once_with(400)
+
+
+def test_group_sync_corrects_a_member_that_ran_out_of_audio() -> None:
+    """A member stays BUFFERING after an output underrun while it plays on, behind the rest."""
+    player, clients, _mass = _group_leader(
+        {
+            "leader": {"apparent_start": 100.0},
+            "m1": {"apparent_start": 101.5, "state": SlimPlayerState.BUFFERING},
+            "m2": {"apparent_start": 100.2},
+        }
+    )
+
+    _run_sync_check(player)
+
+    clients["m1"].skip_over.assert_called_once_with(1500)
+    clients["m2"].skip_over.assert_called_once_with(200)
 
 
 def test_group_sync_ignores_deltas_over_ten_seconds() -> None:
@@ -604,6 +630,11 @@ def test_group_sync_ignores_deltas_over_ten_seconds() -> None:
     clients["m1"].skip_over.assert_not_called()
 
 
+def _report(client: MagicMock, apparent_start: float, measured_at: float) -> None:
+    """Give a mocked client a new play point."""
+    client.playpoint = MagicMock(apparent_start_time=apparent_start, measured_at=measured_at)
+
+
 def test_group_sync_honours_cooldown_and_rate_limit() -> None:
     """Checks run at most about once a second and a corrected member gets a cooldown."""
     player, clients, _mass = _group_leader(
@@ -612,9 +643,63 @@ def test_group_sync_honours_cooldown_and_rate_limit() -> None:
 
     _run_sync_check(player, NOW)
     assert clients["m1"].skip_over.call_count == 1
+    _report(clients["m1"], 100.05, NOW + 0.2)  # the skip landed, 50 ms short
     _run_sync_check(player, NOW + 0.5)  # rate limited
     assert clients["m1"].skip_over.call_count == 1
-    _run_sync_check(player, NOW + 1.5)  # cooldown passed, still behind
+    _run_sync_check(player, NOW + 0.96)  # still cooling down
+    assert clients["m1"].skip_over.call_count == 1
+    _run_sync_check(player, NOW + 2)
+    clients["m1"].skip_over.assert_called_with(50)
+    assert clients["m1"].skip_over.call_count == 2
+
+
+def test_group_sync_never_repeats_a_skip_on_the_position_from_before_it() -> None:
+    """A skip is measured again only once the member's play point shows it."""
+    player, clients, _mass = _group_leader(
+        {
+            "leader": {"apparent_start": 100.0},
+            "m1": {"apparent_start": 100.6},
+            "m2": {"apparent_start": 100.0},
+        }
+    )
+
+    _run_sync_check(player, NOW)
+    clients["m1"].skip_over.assert_called_once_with(600)
+
+    # no report since the skip was sent
+    _run_sync_check(player, NOW + 1.5)
+    # a report from before the command reached the player: its position has not moved
+    _report(clients["m1"], 100.6, NOW + 2.4)
+    _report(clients["leader"], 100.0, NOW + 2.4)
+    _report(clients["m2"], 100.2, NOW + 2.4)
+    _run_sync_check(player, NOW + 2.5)
+    assert clients["m1"].skip_over.call_count == 1
+    # the others are still kept in line meanwhile, and never against the pending member
+    clients["m2"].skip_over.assert_called_once_with(200)
+    clients["leader"].skip_over.assert_not_called()
+
+    # the skip shows: the member is measured again
+    _report(clients["m1"], 100.04, NOW + 3.4)
+    _report(clients["leader"], 100.0, NOW + 3.4)
+    _run_sync_check(player, NOW + 3.5)
+    clients["m1"].skip_over.assert_called_with(40)
+    assert clients["m1"].skip_over.call_count == 2
+
+
+def test_group_sync_retries_a_skip_that_never_showed() -> None:
+    """A skip without effect (too little audio buffered) is sent again after the timeout."""
+    player, clients, _mass = _group_leader(
+        {"leader": {"apparent_start": 100.0}, "m1": {"apparent_start": 100.6}}
+    )
+
+    _run_sync_check(player, NOW)
+    _report(clients["m1"], 100.6, NOW + 4.4)
+    _report(clients["leader"], 100.0, NOW + 4.4)
+    _run_sync_check(player, NOW + 4.5)
+    assert clients["m1"].skip_over.call_count == 1
+    _report(clients["m1"], 100.6, NOW + 5.4)
+    _report(clients["leader"], 100.0, NOW + 5.4)
+    _run_sync_check(player, NOW + 5.5)
     assert clients["m1"].skip_over.call_count == 2
 
 
@@ -644,6 +729,7 @@ def test_member_underrun_clears_its_hold_off() -> None:
     """A member that ran dry is corrected on the next check instead of waiting out a cooldown."""
     leader, _clients, mass = _group_leader({"leader": {}, "m1": {}})
     leader._sync_hold_off_until = {"m1": NOW + 5, "leader": NOW + 5}
+    leader._sync_pending_skip = {"m1": (NOW, 99.0), "leader": (NOW, 99.0)}
     member, member_mass = _player_with_mocked_mass()
     member._player_id = "m1"
     member.logger = MagicMock()
@@ -655,6 +741,7 @@ def test_member_underrun_clears_its_hold_off() -> None:
         member._handle_output_underrun()
 
     assert "m1" not in leader._sync_hold_off_until
+    assert list(leader._sync_pending_skip) == ["leader"]
     assert leader._sync_hold_off_until["leader"] == NOW + 5
     assert mass.create_task.call_count == 0
 

@@ -64,6 +64,7 @@ from .constants import (
     SYNC_MIN_CORRECTION_S,
     SYNC_PLAYPOINT_MAX_AGE_S,
     SYNC_SKIP_COOLDOWN_S,
+    SYNC_SKIP_SETTLE_TIMEOUT_S,
     SYNC_START_HOLD_OFF_S,
     SYNC_START_MAX_LEAD_S,
     SyncSettings,
@@ -72,6 +73,7 @@ from .multi_client_stream import MultiClientStream
 
 if TYPE_CHECKING:
     from aioslimproto.client import SlimClient
+    from aioslimproto.models import PlayPoint
 
     from .provider import SqueezelitePlayerProvider
 
@@ -143,6 +145,9 @@ class SqueezelitePlayer(Player):
         # (right after a scheduled start or a correction), and the time of the last check
         self._sync_hold_off_until: dict[str, float] = {}
         self._last_sync_check: float = 0.0
+        # per corrected member: when its skip was sent and the apparent start time its
+        # play point has to reach before it is measured again
+        self._sync_pending_skip: dict[str, tuple[float, float]] = {}
 
     async def on_config_updated(self) -> None:
         """Handle logic when the PlayerConfig is first loaded or updated."""
@@ -247,6 +252,7 @@ class SqueezelitePlayer(Player):
             await self.multi_client_stream.stop()
             self.multi_client_stream = None
         self._sync_hold_off_until.clear()
+        self._sync_pending_skip.clear()
         async with TaskManager(self.mass) as tg:
             for client in self._get_sync_clients():
                 if self.type == PlayerType.PROTOCOL:
@@ -278,6 +284,7 @@ class SqueezelitePlayer(Player):
             await self.multi_client_stream.stop()
             self.multi_client_stream = None
         self._sync_hold_off_until.clear()
+        self._sync_pending_skip.clear()
 
         # Clear next media item during announcements to prevent playing the
         # next enqueued track after it finishes.
@@ -388,6 +395,7 @@ class SqueezelitePlayer(Player):
                         # remove child from the group; the others play on
                         self._attr_group_members.remove(sync_client.player_id)
                         self._sync_hold_off_until.pop(sync_client.player_id, None)
+                        self._sync_pending_skip.pop(sync_client.player_id, None)
                         if sync_client.state != SlimPlayerState.STOPPED:
                             # stop the player if it is playing
                             await sync_client.stop()
@@ -516,6 +524,7 @@ class SqueezelitePlayer(Player):
 
         :param player_id: The player id of the member that reported the underrun.
         """
+        self._sync_pending_skip.pop(player_id, None)
         if self._sync_hold_off_until.pop(player_id, None) is not None:
             self.logger.debug("%s ran out of audio, it is resynced on the next check", player_id)
 
@@ -755,18 +764,23 @@ class SqueezelitePlayer(Player):
             if not settings.maintain:
                 continue
             playpoint = client.playpoint
+            # a member that ran out of audio stays BUFFERING while it plays on: squeezelite
+            # reports nothing when its output resumes, and that member needs the check most
             if (
-                client.state != SlimPlayerState.PLAYING
+                client.state not in (SlimPlayerState.PLAYING, SlimPlayerState.BUFFERING)
                 or playpoint is None
                 or now - playpoint.measured_at > SYNC_PLAYPOINT_MAX_AGE_S
+                or self._skip_is_pending(client.player_id, playpoint, now)
             ):
-                # a partial view would pick the wrong reference and skip the wrong players
+                # left out rather than aborting: one member without a usable position must
+                # not switch the check off for the others, and the reference stays a real
+                # position, so nobody is skipped past the player furthest ahead
                 self.logger.log(
                     VERBOSE_LOG_LEVEL,
-                    "sync check skipped: no fresh play point from %s",
+                    "%s is left out of the sync check: no usable play point",
                     client.name,
                 )
-                return
+                continue
             candidates.append(
                 (client, playpoint.apparent_start_time + settings.play_delay_ms / 1000, settings)
             )
@@ -793,10 +807,37 @@ class SqueezelitePlayer(Player):
                 continue
             skip_ms = round(behind * 1000)
             self._sync_hold_off_until[client.player_id] = now + SYNC_SKIP_COOLDOWN_S
+            # the command and the report that shows it both take time to cross the network;
+            # measuring again before that repeats the skip and throws this member ahead
+            raw_start = start - settings.play_delay_ms / 1000
+            self._sync_pending_skip[client.player_id] = (now, raw_start - behind / 2)
             self.logger.debug(
                 "%s is %d ms behind %s: skipAhead", client.name, skip_ms, reference_client.name
             )
             self.mass.create_task(client.skip_over(skip_ms))
+
+    def _skip_is_pending(self, player_id: str, playpoint: PlayPoint, now: float) -> bool:
+        """
+        Return whether a skip sent to a member has yet to show in its play point.
+
+        :param player_id: The player id of the member.
+        :param playpoint: The member's latest play point.
+        :param now: The server time of this check.
+        """
+        pending = self._sync_pending_skip.get(player_id)
+        if pending is None:
+            return False
+        sent_at, settled_start = pending
+        if playpoint.measured_at <= sent_at:
+            return True
+        if (
+            playpoint.apparent_start_time > settled_start
+            and now - sent_at < SYNC_SKIP_SETTLE_TIMEOUT_S
+        ):
+            return True
+        # the skip landed, or it never will (too little audio buffered to skip over)
+        del self._sync_pending_skip[player_id]
+        return False
 
     def _handle_output_underrun(self) -> None:
         """Route an output underrun to the sync leader; solo players recover on their own."""
