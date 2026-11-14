@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Coroutine
+from contextlib import suppress
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import pytest
@@ -26,6 +27,7 @@ from music_assistant.providers.squeezelite.constants import (
     DEFAULT_SYNC_MIN_ADJUST_MS,
     DEFAULT_SYNC_PACKET_LATENCY_MS,
     SYNC_CATEGORY,
+    PendingSkip,
 )
 from music_assistant.providers.squeezelite.player import SqueezelitePlayer, is_protocol_only_device
 from tests.common import use_real_create_task
@@ -340,7 +342,10 @@ def _group_leader(
         client.start_at = AsyncMock()
         client.unpause_at = AsyncMock()
         client.stop = AsyncMock()
-        client.skip_over = MagicMock()
+        client.skip_over = AsyncMock()
+        # status requests count up per player; the test acknowledges them by hand
+        client.request_status = AsyncMock(side_effect=range(1, 100))
+        client.acknowledged_status_id = 0
         clients[player_id] = client
         for key in (CONF_SYNC_ADJUST, CONF_SYNC_MAINTAIN, CONF_SYNC_MIN_ADJUST_MS):
             if key in spec:
@@ -350,7 +355,15 @@ def _group_leader(
     mass.config.get_raw_player_config_value.side_effect = lambda pid, key, default=None: config.get(
         (pid, key), default
     )
+    mass.create_task.side_effect = _run_to_completion
     return player, clients, mass
+
+
+def _run_to_completion(coro: object, **_kwargs: object) -> None:
+    """Run a coroutine that only awaits mocks, standing in for mass.create_task."""
+    if isinstance(coro, Coroutine):
+        with suppress(StopIteration):
+            coro.send(None)
 
 
 def _frozen_clock(*values: float) -> MagicMock:
@@ -542,9 +555,9 @@ def test_group_sync_skips_members_behind_the_most_ahead_player() -> None:
 
     _run_sync_check(player)
 
-    clients["leader"].skip_over.assert_called_once_with(100)
-    clients["m1"].skip_over.assert_called_once_with(600)
-    clients["m2"].skip_over.assert_not_called()
+    clients["leader"].skip_over.assert_awaited_once_with(100)
+    clients["m1"].skip_over.assert_awaited_once_with(600)
+    clients["m2"].skip_over.assert_not_awaited()
 
 
 def test_group_sync_applies_the_leaders_own_play_delay() -> None:
@@ -558,8 +571,8 @@ def test_group_sync_applies_the_leaders_own_play_delay() -> None:
 
     _run_sync_check(player)
 
-    clients["leader"].skip_over.assert_called_once_with(300)
-    clients["m1"].skip_over.assert_not_called()
+    clients["leader"].skip_over.assert_awaited_once_with(300)
+    clients["m1"].skip_over.assert_not_awaited()
 
 
 def test_group_sync_respects_min_adjust_and_maintain() -> None:
@@ -576,7 +589,7 @@ def test_group_sync_respects_min_adjust_and_maintain() -> None:
     _run_sync_check(player)
 
     for client in clients.values():
-        client.skip_over.assert_not_called()
+        client.skip_over.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -598,9 +611,9 @@ def test_group_sync_leaves_out_a_member_without_a_usable_playpoint(
 
     _run_sync_check(player)
 
-    clients["leader"].skip_over.assert_not_called()
-    clients["m1"].skip_over.assert_not_called()
-    clients["m2"].skip_over.assert_called_once_with(400)
+    clients["leader"].skip_over.assert_not_awaited()
+    clients["m1"].skip_over.assert_not_awaited()
+    clients["m2"].skip_over.assert_awaited_once_with(400)
 
 
 def test_group_sync_corrects_a_member_that_ran_out_of_audio() -> None:
@@ -615,8 +628,8 @@ def test_group_sync_corrects_a_member_that_ran_out_of_audio() -> None:
 
     _run_sync_check(player)
 
-    clients["m1"].skip_over.assert_called_once_with(1500)
-    clients["m2"].skip_over.assert_called_once_with(200)
+    clients["m1"].skip_over.assert_awaited_once_with(1500)
+    clients["m2"].skip_over.assert_awaited_once_with(200)
 
 
 def test_group_sync_ignores_deltas_over_ten_seconds() -> None:
@@ -627,7 +640,7 @@ def test_group_sync_ignores_deltas_over_ten_seconds() -> None:
 
     _run_sync_check(player)
 
-    clients["m1"].skip_over.assert_not_called()
+    clients["m1"].skip_over.assert_not_awaited()
 
 
 def _report(client: MagicMock, apparent_start: float, measured_at: float) -> None:
@@ -640,21 +653,20 @@ def test_group_sync_honours_cooldown_and_rate_limit() -> None:
     player, clients, _mass = _group_leader(
         {"leader": {"apparent_start": 100.0}, "m1": {"apparent_start": 100.6}}
     )
+    player._sync_hold_off_until["m1"] = NOW + 2.5
 
-    _run_sync_check(player, NOW)
-    assert clients["m1"].skip_over.call_count == 1
-    _report(clients["m1"], 100.05, NOW + 0.2)  # the skip landed, 50 ms short
-    _run_sync_check(player, NOW + 0.5)  # rate limited
-    assert clients["m1"].skip_over.call_count == 1
-    _run_sync_check(player, NOW + 0.96)  # still cooling down
-    assert clients["m1"].skip_over.call_count == 1
+    _run_sync_check(player, NOW)  # held off, e.g. right after the group start
     _run_sync_check(player, NOW + 2)
-    clients["m1"].skip_over.assert_called_with(50)
-    assert clients["m1"].skip_over.call_count == 2
+    assert clients["m1"].skip_over.await_count == 0
+    _run_sync_check(player, NOW + 2.6)  # rate limited
+    assert clients["m1"].skip_over.await_count == 0
+    _run_sync_check(player, NOW + 3)
+    clients["m1"].skip_over.assert_awaited_once_with(600)
+    assert player._sync_hold_off_until["m1"] == NOW + 3 + 1.0
 
 
-def test_group_sync_never_repeats_a_skip_on_the_position_from_before_it() -> None:
-    """A skip is measured again only once the member's play point shows it."""
+def test_group_sync_never_repeats_a_skip_the_member_has_yet_to_report_on() -> None:
+    """A skipped member is measured again only once it reports from after the skip."""
     player, clients, _mass = _group_leader(
         {
             "leader": {"apparent_start": 100.0},
@@ -664,43 +676,52 @@ def test_group_sync_never_repeats_a_skip_on_the_position_from_before_it() -> Non
     )
 
     _run_sync_check(player, NOW)
-    clients["m1"].skip_over.assert_called_once_with(600)
+    clients["m1"].skip_over.assert_awaited_once_with(600)
+    clients["m1"].request_status.assert_awaited_once()
 
-    # no report since the skip was sent
-    _run_sync_check(player, NOW + 1.5)
-    # a report from before the command reached the player: its position has not moved
-    _report(clients["m1"], 100.6, NOW + 2.4)
-    _report(clients["leader"], 100.0, NOW + 2.4)
-    _report(clients["m2"], 100.2, NOW + 2.4)
-    _run_sync_check(player, NOW + 2.5)
-    assert clients["m1"].skip_over.call_count == 1
-    # the others are still kept in line meanwhile, and never against the pending member
-    clients["m2"].skip_over.assert_called_once_with(200)
-    clients["leader"].skip_over.assert_not_called()
+    # the skip is still on its way, however long: fresh reports show the old position
+    for later in (2.5, 9.5, 30.5):
+        for client in clients.values():
+            _report(client, client.playpoint.apparent_start_time, NOW + later - 0.1)
+        if later == 9.5:
+            _report(clients["m2"], 100.2, NOW + later - 0.1)
+        _run_sync_check(player, NOW + later)
+    assert clients["m1"].skip_over.await_count == 1
+    # the others are kept in line meanwhile, and never against the pending member
+    clients["m2"].skip_over.assert_awaited_once_with(200)
+    clients["leader"].skip_over.assert_not_awaited()
 
-    # the skip shows: the member is measured again
-    _report(clients["m1"], 100.04, NOW + 3.4)
-    _report(clients["leader"], 100.0, NOW + 3.4)
-    _run_sync_check(player, NOW + 3.5)
-    clients["m1"].skip_over.assert_called_with(40)
-    assert clients["m1"].skip_over.call_count == 2
+    # the member echoes the status request sent behind the skip: it has the skip, but
+    # this report may predate its effect
+    clients["m1"].acknowledged_status_id = 1
+    _report(clients["m1"], 100.6, NOW + 40.4)
+    _report(clients["leader"], 100.0, NOW + 40.4)
+    _run_sync_check(player, NOW + 40.5)
+    assert clients["m1"].skip_over.await_count == 1
+
+    # the next report shows where the skip left it
+    _report(clients["m1"], 100.04, NOW + 41.4)
+    _report(clients["leader"], 100.0, NOW + 41.4)
+    _run_sync_check(player, NOW + 41.5)
+    clients["m1"].skip_over.assert_awaited_with(40)
+    assert clients["m1"].skip_over.await_count == 2
 
 
-def test_group_sync_retries_a_skip_that_never_showed() -> None:
-    """A skip without effect (too little audio buffered) is sent again after the timeout."""
+def test_group_sync_finishes_a_skip_that_fell_short() -> None:
+    """A skip that could only cover part of the gap is followed up once it is reported."""
     player, clients, _mass = _group_leader(
         {"leader": {"apparent_start": 100.0}, "m1": {"apparent_start": 100.6}}
     )
 
     _run_sync_check(player, NOW)
-    _report(clients["m1"], 100.6, NOW + 4.4)
-    _report(clients["leader"], 100.0, NOW + 4.4)
-    _run_sync_check(player, NOW + 4.5)
-    assert clients["m1"].skip_over.call_count == 1
-    _report(clients["m1"], 100.6, NOW + 5.4)
-    _report(clients["leader"], 100.0, NOW + 5.4)
-    _run_sync_check(player, NOW + 5.5)
-    assert clients["m1"].skip_over.call_count == 2
+    clients["m1"].acknowledged_status_id = 1
+    _run_sync_check(player, NOW + 1.5)
+    _report(clients["m1"], 100.4, NOW + 2.4)
+    _report(clients["leader"], 100.0, NOW + 2.4)
+    _run_sync_check(player, NOW + 2.5)
+
+    clients["m1"].skip_over.assert_awaited_with(400)
+    assert clients["m1"].skip_over.await_count == 2
 
 
 def test_group_sync_runs_from_the_leaders_heartbeat_only() -> None:
@@ -729,7 +750,8 @@ def test_member_underrun_clears_its_hold_off() -> None:
     """A member that ran dry is corrected on the next check instead of waiting out a cooldown."""
     leader, _clients, mass = _group_leader({"leader": {}, "m1": {}})
     leader._sync_hold_off_until = {"m1": NOW + 5, "leader": NOW + 5}
-    leader._sync_pending_skip = {"m1": (NOW, 99.0), "leader": (NOW, 99.0)}
+    pending = PendingSkip(status_id=3)
+    leader._sync_pending_skip = {"m1": pending}
     member, member_mass = _player_with_mocked_mass()
     member._player_id = "m1"
     member.logger = MagicMock()
@@ -741,7 +763,8 @@ def test_member_underrun_clears_its_hold_off() -> None:
         member._handle_output_underrun()
 
     assert "m1" not in leader._sync_hold_off_until
-    assert list(leader._sync_pending_skip) == ["leader"]
+    # a skip on its way still lands: the member is not measured before it has
+    assert leader._sync_pending_skip == {"m1": pending}
     assert leader._sync_hold_off_until["leader"] == NOW + 5
     assert mass.create_task.call_count == 0
 

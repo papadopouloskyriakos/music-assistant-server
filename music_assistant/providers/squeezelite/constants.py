@@ -36,7 +36,6 @@ SYNC_PLAYPOINT_MAX_AGE_S = 6.0  # the 5 s heartbeat is the slowest status cadenc
 SYNC_MIN_CORRECTION_S = 0.010
 SYNC_MAX_CORRECTION_S = 10.0
 SYNC_SKIP_COOLDOWN_S = 1.0
-SYNC_SKIP_SETTLE_TIMEOUT_S = 5.0  # under SYNC_PLAYPOINT_MAX_AGE_S
 SYNC_START_HOLD_OFF_S = 2.0
 SYNC_START_MAX_LEAD_S = 9.0  # squeezelite starts at once when told to start > 10 s ahead
 BUFFER_READY_TIMEOUT_S = 8.0
@@ -121,3 +120,11 @@ class SyncSettings:
     play_delay_ms: int  # sync_adjust: positive plays earlier (Lyrion's playDelay)
     maintain: bool
     min_adjust_ms: int
+
+
+@dataclass
+class PendingSkip:
+    """A skip sent to a sync member whose effect has yet to show in its play point."""
+
+    status_id: int | None = None  # the status request sent right behind the skip
+    acknowledged_at: float | None = None  # server time the check saw that request echoed

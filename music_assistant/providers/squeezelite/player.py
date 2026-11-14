@@ -64,9 +64,9 @@ from .constants import (
     SYNC_MIN_CORRECTION_S,
     SYNC_PLAYPOINT_MAX_AGE_S,
     SYNC_SKIP_COOLDOWN_S,
-    SYNC_SKIP_SETTLE_TIMEOUT_S,
     SYNC_START_HOLD_OFF_S,
     SYNC_START_MAX_LEAD_S,
+    PendingSkip,
     SyncSettings,
 )
 from .multi_client_stream import MultiClientStream
@@ -145,9 +145,8 @@ class SqueezelitePlayer(Player):
         # (right after a scheduled start or a correction), and the time of the last check
         self._sync_hold_off_until: dict[str, float] = {}
         self._last_sync_check: float = 0.0
-        # per corrected member: when its skip was sent and the apparent start time its
-        # play point has to reach before it is measured again
-        self._sync_pending_skip: dict[str, tuple[float, float]] = {}
+        # per corrected member: the skip it has yet to report back on
+        self._sync_pending_skip: dict[str, PendingSkip] = {}
 
     async def on_config_updated(self) -> None:
         """Handle logic when the PlayerConfig is first loaded or updated."""
@@ -524,7 +523,6 @@ class SqueezelitePlayer(Player):
 
         :param player_id: The player id of the member that reported the underrun.
         """
-        self._sync_pending_skip.pop(player_id, None)
         if self._sync_hold_off_until.pop(player_id, None) is not None:
             self.logger.debug("%s ran out of audio, it is resynced on the next check", player_id)
 
@@ -770,7 +768,7 @@ class SqueezelitePlayer(Player):
                 client.state not in (SlimPlayerState.PLAYING, SlimPlayerState.BUFFERING)
                 or playpoint is None
                 or now - playpoint.measured_at > SYNC_PLAYPOINT_MAX_AGE_S
-                or self._skip_is_pending(client.player_id, playpoint, now)
+                or self._skip_is_pending(client, playpoint, now)
             ):
                 # left out rather than aborting: one member without a usable position must
                 # not switch the check off for the others, and the reference stays a real
@@ -809,34 +807,44 @@ class SqueezelitePlayer(Player):
             self._sync_hold_off_until[client.player_id] = now + SYNC_SKIP_COOLDOWN_S
             # the command and the report that shows it both take time to cross the network;
             # measuring again before that repeats the skip and throws this member ahead
-            raw_start = start - settings.play_delay_ms / 1000
-            self._sync_pending_skip[client.player_id] = (now, raw_start - behind / 2)
+            pending = self._sync_pending_skip[client.player_id] = PendingSkip()
             self.logger.debug(
                 "%s is %d ms behind %s: skipAhead", client.name, skip_ms, reference_client.name
             )
-            self.mass.create_task(client.skip_over(skip_ms))
+            self.mass.create_task(self._skip_ahead(client, skip_ms, pending))
 
-    def _skip_is_pending(self, player_id: str, playpoint: PlayPoint, now: float) -> bool:
+    async def _skip_ahead(self, client: SlimClient, skip_ms: int, pending: PendingSkip) -> None:
+        """
+        Skip a member ahead and ask it for a status report right behind the skip.
+
+        :param client: The member to skip ahead.
+        :param skip_ms: The time to skip over, in milliseconds.
+        :param pending: The record the sync check holds for this skip.
+        """
+        await client.skip_over(skip_ms)
+        # the player handles commands in order: once it echoes this request, it has the skip
+        pending.status_id = await client.request_status()
+
+    def _skip_is_pending(self, client: SlimClient, playpoint: PlayPoint, now: float) -> bool:
         """
         Return whether a skip sent to a member has yet to show in its play point.
 
-        :param player_id: The player id of the member.
+        :param client: The member.
         :param playpoint: The member's latest play point.
         :param now: The server time of this check.
         """
-        pending = self._sync_pending_skip.get(player_id)
+        pending = self._sync_pending_skip.get(client.player_id)
         if pending is None:
             return False
-        sent_at, settled_start = pending
-        if playpoint.measured_at <= sent_at:
+        if pending.status_id is None or client.acknowledged_status_id < pending.status_id:
+            # still on its way, however long that takes: sending it again adds up
             return True
-        if (
-            playpoint.apparent_start_time > settled_start
-            and now - sent_at < SYNC_SKIP_SETTLE_TIMEOUT_S
-        ):
+        if pending.acknowledged_at is None:
+            pending.acknowledged_at = now
+        if playpoint.measured_at <= pending.acknowledged_at:
+            # the player applies the skip just after it answers; the next report shows it
             return True
-        # the skip landed, or it never will (too little audio buffered to skip over)
-        del self._sync_pending_skip[player_id]
+        del self._sync_pending_skip[client.player_id]
         return False
 
     def _handle_output_underrun(self) -> None:
