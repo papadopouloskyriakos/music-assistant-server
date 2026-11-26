@@ -57,3 +57,66 @@ async def test_runner_closes_the_source_when_no_client_connects() -> None:
     await stream.task
 
     assert closed.is_set()
+
+
+async def _next_chunk(subscription: AsyncGenerator[bytes]) -> bytes | None:
+    """Return the next chunk of a subscription, or None once it has ended."""
+    try:
+        return await asyncio.wait_for(anext(subscription), 1)
+    except StopAsyncIteration:
+        return None
+
+
+@pytest.mark.usefixtures("instant_sleep")
+async def test_stop_ends_every_subscriber() -> None:
+    """
+    Stopping the stream ends the subscriptions instead of leaving them waiting.
+
+    Each subscription feeds the encoder of one speaker, and that encoder only exits
+    when its input ends, so a subscription left waiting leaks a process per speaker
+    on every restart of the group.
+    """
+
+    async def _source() -> AsyncGenerator[bytes]:
+        while True:
+            yield b"chunk"
+
+    stream = MultiClientStream(
+        audio_source=_source(),
+        audio_format=PCM_FORMAT,
+        queue_id="queue-1",
+        session_id="session-1",
+        expected_clients=2,
+    )
+    subscriptions = [stream.subscribe_raw(), stream.subscribe_raw()]
+    for subscription in subscriptions:
+        assert await _next_chunk(subscription) == b"chunk"
+
+    await stream.stop()
+
+    for subscription in subscriptions:
+        assert await _next_chunk(subscription) is None
+    assert stream.subscribers == []
+
+
+@pytest.mark.usefixtures("instant_sleep")
+async def test_failing_source_ends_every_subscriber() -> None:
+    """A source that raises ends the subscriptions as well."""
+
+    async def _source() -> AsyncGenerator[bytes]:
+        yield b"chunk"
+        raise RuntimeError("source failed")
+
+    stream = MultiClientStream(
+        audio_source=_source(),
+        audio_format=PCM_FORMAT,
+        queue_id="queue-1",
+        session_id="session-1",
+    )
+    subscription = stream.subscribe_raw()
+    assert await _next_chunk(subscription) == b"chunk"
+
+    with pytest.raises(RuntimeError):
+        await stream.task
+
+    assert await _next_chunk(subscription) is None

@@ -51,8 +51,7 @@ class MultiClientStream:
         self.task.cancel()
         with suppress(asyncio.CancelledError):
             await self.task
-        for sub_queue in list(self.subscribers):
-            empty_queue(sub_queue)
+        self._end_subscribers()
 
     async def get_stream(
         self,
@@ -84,6 +83,14 @@ class MultiClientStream:
 
     async def _runner(self) -> None:
         """Run the stream for the given audio source."""
+        try:
+            await self._distribute()
+        except BaseException:
+            self._end_subscribers()
+            raise
+
+    async def _distribute(self) -> None:
+        """Hand every chunk of the audio source to all subscribers."""
         expected_clients = self.expected_clients or 1
         # wait for first/all subscriber
         count = 0
@@ -113,3 +120,12 @@ class MultiClientStream:
                 )
         # EOF: send empty chunk
         await asyncio.gather(*[sub.put(b"") for sub in self.subscribers], return_exceptions=True)
+
+    def _end_subscribers(self) -> None:
+        """Tell every subscriber that no more audio will come."""
+        # a subscriber left waiting keeps its encoder process and its HTTP response
+        # open forever, so a stream that ends early must still deliver the end marker;
+        # whatever is still queued is dropped to make room for it
+        for sub_queue in list(self.subscribers):
+            empty_queue(sub_queue)
+            sub_queue.put_nowait(b"")
